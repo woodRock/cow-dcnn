@@ -28,8 +28,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 from encoder import SpectrumEncoder
 
-DATA_DIR = Path(__file__).parent.parent / 'data'
-CKPT_DIR = Path(__file__).parent.parent / 'checkpoints'
+DATA_DIR    = Path(__file__).parent.parent / 'data'
+CKPT_DIR    = Path(__file__).parent.parent / 'checkpoints'
+RESULTS_DIR = Path(__file__).parent.parent / 'results'
+
+class _Tee:
+    def __init__(self, fh):
+        self._fh, self._orig = fh, sys.stdout
+    def write(self, s):
+        self._orig.write(s); self._fh.write(s)
+    def flush(self):
+        self._orig.flush(); self._fh.flush()
 
 N_BINS      = 200
 RUN_MIN     = 45.0
@@ -218,4 +227,12 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    main()
+    RESULTS_DIR.mkdir(exist_ok=True)
+    _out = RESULTS_DIR / 'encoder_evaluation.txt'
+    with open(_out, 'w') as _fh:
+        _orig, sys.stdout = sys.stdout, _Tee(_fh)
+        try:
+            main()
+        finally:
+            sys.stdout = _orig
+    print(f'Results saved → {_out}')
