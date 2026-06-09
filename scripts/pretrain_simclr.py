@@ -157,7 +157,12 @@ def stage2(model, device, epochs=200, batch_size=64, lr=5e-5):
 
 # ── Main ───────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
     print(f"Device: {device}\n")
 
     model = stage1(device)
