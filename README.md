@@ -129,36 +129,41 @@ shifted retention times.
 
 ### Downstream classification (fish species, 4-class, 5-fold × 3 seeds)
 
-Metric: balanced accuracy (mean ± std over 15 runs). Classifiers evaluated on
-ChromatogramCNN (pretrained / from scratch) and classical baselines (PLS-DA, RF)
-on the per-m/z max-projection feature vector.
+Metric: balanced accuracy (mean ± std over 15 runs). Classifiers: ChromatogramCNN
+with next-frame-prediction pretraining or random initialisation; PLS-DA and RF on the
+per-m/z max-projection feature vector. Alignment methods cited from the literature.
 
 | Alignment | CNN (pretrained) | CNN (from scratch) | PLS-DA | RF |
 |---|---|---|---|---|
 | No alignment | **0.964 ± 0.072** | 0.679 ± 0.196 | 0.325 ± 0.101 | 0.363 ± 0.076 |
-| Global shift | 0.950 ± 0.124 | **0.761 ± 0.171** | 0.311 ± 0.099 | 0.363 ± 0.096 |
-| Segment shift | 0.901 ± 0.146 | 0.615 ± 0.162 | 0.339 ± 0.082 | 0.355 ± 0.059 |
+| Co-shift [Savorani 2010] | 0.947 ± 0.130 | **0.764 ± 0.119** | 0.323 ± 0.097 | 0.362 ± 0.092 |
+| icoshift [Savorani 2010] | 0.911 ± 0.148 | 0.659 ± 0.126 | 0.332 ± 0.109 | 0.353 ± 0.080 |
+| COW [Nielsen 1998] | 0.888 ± 0.122 | 0.710 ± 0.165 | 0.322 ± 0.099 | 0.383 ± 0.094 |
 | m/z COW (cosine) | 0.853 ± 0.129 | 0.681 ± 0.220 | 0.333 ± 0.083 | 0.391 ± 0.074 |
 | m/z COW (drift enc.) | 0.856 ± 0.133 | 0.717 ± 0.139 | 0.329 ± 0.086 | **0.411 ± 0.078** |
 
-**Key finding:** the pretrained CNN achieves 0.964 balanced accuracy *without* any
-alignment, and every alignment method degrades it monotonically
-(0.964 → 0.950 → 0.901 → 0.853). The pretrained model was trained on raw,
-unaligned chromatograms; post-hoc warping takes chromatograms out of that
-distribution and introduces artefacts the model was never exposed to during
-next-frame prediction pretraining.
+**Key findings:**
 
-For models without pretraining, alignment offers a modest benefit (0.679 → 0.761 with
-a global shift), but the gap between pretrained and from-scratch is far larger than
-any alignment gain. Classical methods (PLS-DA, RF) remain poor regardless of
-alignment; the per-m/z max-projection feature is a coarse representation that
-discards temporal structure.
+- *Pretraining dominates alignment.* The pretrained CNN without any alignment (0.964)
+  outperforms every aligned condition for the from-scratch model (best: 0.764).
+  The pretraining gap is an order of magnitude larger than any alignment gain.
 
-**Limitations.** Results are from a single dataset (103 fish oil samples). The
-classical baselines may be disadvantaged by the choice of max-projection features
-rather than a conventional aligned peak table. The chroma-dcnn pretrained checkpoint
-should be verified as trained independently of the fish oil evaluation data to rule
-out distribution leakage.
+- *Every alignment method degrades the pretrained CNN.* The decline is monotone with
+  alignment complexity: 0.964 → 0.947 (co-shift) → 0.911 (icoshift) → 0.888 (COW)
+  → 0.853 (m/z COW). The pretrained model was trained on raw unaligned chromatograms;
+  post-hoc warping takes the input out of its training distribution.
+
+- *For models without pretraining, only simple alignment helps.* Co-shift improves
+  from-scratch accuracy (+0.085) and reduces variance (σ: 0.196 → 0.119). Icoshift
+  and m/z COW (cosine) do not improve over no alignment; only co-shift and COW yield
+  a net gain.
+
+- *Classical methods are alignment-insensitive.* PLS-DA (0.322–0.333) and RF
+  (0.353–0.411) show no consistent improvement across alignment conditions.
+
+**Limitations.** Results are from a single dataset (103 fish oil samples, 4 classes).
+Classical baselines use a max-projection feature rather than a conventional aligned
+peak table, which may understate their performance.
 
 ## Exploration
 

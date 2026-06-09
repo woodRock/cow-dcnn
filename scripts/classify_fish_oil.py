@@ -1,27 +1,36 @@
 """
-Does chromatogram alignment improve downstream fish species classification?
+Does explicit retention time alignment improve downstream fish species classification
+when a pretrained chromatogram encoder is available?
 
-Alignment methods compared
-──────────────────────────
-  No alignment          — raw chromatograms, no preprocessing
-  Global shift          — single lag from FFT cross-correlation of TICs
-  Segment shift         — icoshift-style: per-segment FFT shift (10 segments)
-  m/z COW (cosine)      — m/z fingerprint anchored warp, raw cosine similarity
-  m/z COW (drift enc.)  — m/z fingerprint anchored warp, drift encoder
+Alignment methods
+─────────────────
+  Co-shift (global)    FFT whole-spectrum co-shift [Savorani 2010]
+  icoshift             Interval-based FFT co-shift, 10 intervals [Savorani 2010]
+  COW                  Correlation Optimised Warping, DP [Nielsen 1998]
+  m/z COW (cosine)     COW anchored by m/z fingerprint cosine similarity
+  m/z COW (drift enc.) COW anchored by drift encoder embeddings
 
 Classifiers
 ───────────
   ChromatogramCNN  from_scratch    — dilated ResBlock 1D CNN, random init
-  ChromatogramCNN  chroma_pretrain — same arch, weights from next-frame prediction
+  ChromatogramCNN  chroma_pretrain — same arch, next-frame-prediction pretraining
   PLS-DA                           — classical metabolomics baseline
-  Random Forest                    — tree ensemble on max-projection spectrum
+  Random Forest                    — tree ensemble on per-m/z max-projection
 
-All CNN conditions use ChromatogramCNN from chroma-dcnn (so results are directly
-comparable with the chroma-dcnn paper). Classical baselines use the per-m/z
-max-projection of the aligned chromatogram as their feature vector.
+All CNN conditions use ChromatogramCNN from chroma-dcnn so results are directly
+comparable with the chroma-dcnn paper. Classical baselines use the per-m/z
+max-projection of the aligned chromatogram.
 
 Evaluation: 5-fold stratified CV × 3 seeds = 15 runs per condition.
-Metric: balanced accuracy and macro-F1.
+Metric: balanced accuracy.
+
+References
+──────────
+Savorani F, Tomasi G, Engelsen SB (2010) icoshift: A versatile tool for the
+  rapid alignment of 1D NMR spectra. J Magn Reson 202:190-202.
+Nielsen N-PV, Carstensen JM, Smedsgaard J (1998) Aligning of single and multiple
+  wavelength chromatographic profiles for chemometric data analysis using
+  correlation optimised warping. J Chromatogr A 805:17-35.
 """
 
 from __future__ import annotations
@@ -34,7 +43,7 @@ import torch
 from pathlib import Path
 from scipy.interpolate import interp1d
 from scipy.optimize import linear_sum_assignment
-from scipy.signal import find_peaks as sp_find_peaks, fftconvolve
+from scipy.signal import find_peaks as sp_find_peaks
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 sys.path.insert(0, '/Users/woodj/Desktop/chroma-dcnn/src')
@@ -44,10 +53,10 @@ from chroma_dcnn.models.chroma_cnn import ChromaCNNConfig
 from chroma_dcnn.training.finetune_chroma import ChromaFinetuner
 from chroma_dcnn.evaluation.baselines import baseline_cv
 
-DATA_DIR      = Path(__file__).parent.parent / 'data'
-CKPT_DIR      = Path(__file__).parent.parent / 'checkpoints'
-CHROMA_CKPT   = Path('/Users/woodj/Desktop/chroma-dcnn/checkpoints/chroma_pretrain/best.pt')
-FISH_CHROMA   = DATA_DIR / 'fish_oil' / 'chroma'
+DATA_DIR    = Path(__file__).parent.parent / 'data'
+CKPT_DIR    = Path(__file__).parent.parent / 'checkpoints'
+CHROMA_CKPT = Path('/Users/woodj/Desktop/chroma-dcnn/checkpoints/chroma_pretrain/best.pt')
+FISH_CHROMA = DATA_DIR / 'fish_oil' / 'chroma'
 
 N_BINS  = 200
 RUN_MIN = 45.0
@@ -64,7 +73,7 @@ CV_CFG = {
     'task': {
         'num_classes': 4,
         'cv_folds': 5,
-        'cv_seeds': [0, 1, 2],      # 3 seeds × 5 folds = 15 runs
+        'cv_seeds': [0, 1, 2],
         'cv_strategy': 'kfold',
     },
     'finetuning': {
@@ -82,7 +91,7 @@ CV_CFG = {
 }
 
 
-# ── Alignment helpers ─────────────────────────────────────────────────────────
+# ── Shared utilities ──────────────────────────────────────────────────────────
 
 def _l2(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
@@ -100,7 +109,7 @@ def _detect_peaks(chroma: np.ndarray) -> np.ndarray:
 
 
 def _warp_chroma(query: np.ndarray, warp_fn) -> np.ndarray:
-    """Apply a time-warp function to the full 2D chromatogram."""
+    """Apply a time-warp function to a full 2D chromatogram (N_BINS × mz)."""
     query_times = np.clip(warp_fn(TIME_AX), 0, RUN_MIN)
     warped = np.zeros_like(query)
     for i, t in enumerate(query_times):
@@ -112,99 +121,194 @@ def _warp_chroma(query: np.ndarray, warp_fn) -> np.ndarray:
     return warped.astype(np.float32)
 
 
-# ── Alignment method 1: global shift ─────────────────────────────────────────
-
-def align_global_shift(query: np.ndarray, ref: np.ndarray,
-                        max_shift_bins: int = 20) -> np.ndarray:
-    """Find best global lag via FFT cross-correlation of TICs; shift full 2D chroma."""
-    ref_tic = ref.sum(axis=1)
-    q_tic   = query.sum(axis=1)
-    corr    = fftconvolve(ref_tic, q_tic[::-1], mode='full')
-    lags    = np.arange(-(N_BINS - 1), N_BINS)
-    valid   = np.abs(lags) <= max_shift_bins
-    best_lag = int(lags[valid][np.argmax(corr[valid])])  # positive = query is ahead
-
-    ref_bins = np.arange(N_BINS, dtype=float) * BIN_MIN
-    q_bins   = ref_bins + best_lag * BIN_MIN             # query_time = ref_time + lag
-    warp_fn  = interp1d(ref_bins, q_bins, kind='linear',
-                        bounds_error=False, fill_value='extrapolate')
-    return _warp_chroma(query, warp_fn)
+def _apply_int_shift(signal: np.ndarray, lag: int) -> np.ndarray:
+    """Integer-sample shift; edges filled with nearest value."""
+    if lag == 0:
+        return signal.copy()
+    out = np.roll(signal, lag)
+    if lag > 0:
+        out[:lag] = signal[0]
+    else:
+        out[lag:] = signal[-1]
+    return out
 
 
-# ── Alignment method 2: segment shift (icoshift-style) ───────────────────────
+# ── Published method 1: Co-shift (global, Savorani et al. 2010) ──────────────
 
-def align_segment_shift(query: np.ndarray, ref: np.ndarray,
-                         n_segments: int = 10, max_shift_bins: int = 10) -> np.ndarray:
+def align_coshift(query: np.ndarray, ref: np.ndarray,
+                  max_shift_bins: int = 30) -> np.ndarray:
     """
-    Divide TIC into n_segments; find best local shift for each via cross-correlation.
-    Monotone piecewise-linear warp fitted through the segment-centre shifts.
+    Whole-spectrum co-shift via FFT cross-correlation.
+
+    Special case of icoshift (Savorani et al., 2010) with inter='whole'.
+    Finds the single integer lag that maximises TIC cross-correlation,
+    then applies the same shift uniformly to all m/z channels.
     """
     ref_tic = ref.sum(axis=1)
     q_tic   = query.sum(axis=1)
-    seg_len = N_BINS // n_segments
+    n       = len(ref_tic)
 
-    ref_pts = [0.0]
-    q_pts   = [0.0]
+    cc   = np.correlate(ref_tic, q_tic, mode='full')
+    lags = np.arange(-(n - 1), n)
+    valid = np.abs(lags) <= max_shift_bins
+    best_lag = int(lags[valid][np.argmax(cc[valid])])
 
-    for s in range(n_segments):
-        lo  = s * seg_len
-        hi  = min(lo + seg_len, N_BINS)
-        mid = (lo + hi) / 2.0
+    warped = np.stack([_apply_int_shift(query[:, mz], best_lag)
+                       for mz in range(query.shape[1])], axis=1)
+    return warped.astype(np.float32)
 
-        # Pad reference segment to allow cross-correlation with shift
-        pad = max_shift_bins
+
+# ── Published method 2: icoshift (interval, Savorani et al. 2010) ────────────
+
+def align_icoshift(query: np.ndarray, ref: np.ndarray,
+                   n_intervals: int = 10,
+                   max_shift_bins: int = 15) -> np.ndarray:
+    """
+    Interval-based co-shift (icoshift, Savorani et al., 2010).
+
+    Divides the TIC into n_intervals equal segments. For each segment,
+    finds the integer shift that maximises cross-correlation with the
+    reference segment. Each interval of the 2D chromatogram is shifted
+    independently by that lag, with edge values used to fill the gaps.
+    """
+    ref_tic = ref.sum(axis=1)
+    q_tic   = query.sum(axis=1)
+    seg_len = N_BINS // n_intervals
+    warped  = np.empty_like(query)
+
+    for s in range(n_intervals):
+        lo = s * seg_len
+        hi = min(lo + seg_len, N_BINS)
+
         ref_seg = ref_tic[lo:hi]
-        q_lo    = max(0, lo - pad)
-        q_hi    = min(N_BINS, hi + pad)
-        q_seg   = q_tic[q_lo:q_hi]
+        q_seg   = q_tic[lo:hi]
 
-        corr = fftconvolve(ref_seg, q_seg[::-1], mode='full')
-        lags = np.arange(-(len(q_seg) - 1), len(ref_seg))
+        pad   = max_shift_bins
+        ref_p = np.pad(ref_seg, pad)
+        q_p   = np.pad(q_seg,   pad)
+
+        cc    = np.correlate(ref_p, q_p, mode='full')
+        n     = len(ref_p)
+        lags  = np.arange(-(n - 1), n)
         valid = np.abs(lags) <= pad
-        if valid.any():
-            best_lag = int(lags[valid][np.argmax(corr[valid])])
-        else:
-            best_lag = 0
+        best_lag = int(lags[valid][np.argmax(cc[valid])]) if valid.any() else 0
 
-        ref_pts.append(mid * BIN_MIN)
-        q_pts.append(np.clip((mid + best_lag) * BIN_MIN, 0, RUN_MIN))
+        # Apply integer shift to every m/z channel in this interval.
+        # lag < 0 → query is ahead → roll backward; lag > 0 → roll forward.
+        for mz in range(query.shape[1]):
+            seg = query[lo:hi, mz]
+            warped[lo:hi, mz] = _apply_int_shift(seg, -best_lag)
 
-    ref_pts.append(RUN_MIN)
-    q_pts.append(RUN_MIN)
+    return warped.astype(np.float32)
 
-    # Enforce monotonicity
+
+# ── Published method 3: COW (Nielsen et al. 1998) ────────────────────────────
+
+def align_cow(query: np.ndarray, ref: np.ndarray,
+              n_segments: int = 10,
+              slack: int = 10) -> np.ndarray:
+    """
+    Correlation Optimised Warping (Nielsen et al., 1998).
+
+    Dynamic programming finds boundary points b[0..N] partitioning the query
+    TIC into N segments such that the sum of Pearson correlations between
+    reference segment i and query segment b[i]→b[i+1] is maximised, subject
+    to each query segment length lying in [T-slack, T+slack] where T = M/N.
+    """
+    ref_tic = ref.sum(axis=1)
+    q_tic   = query.sum(axis=1)
+    M, T, N = N_BINS, N_BINS // n_segments, n_segments
+
+    def seg_corr(r_seg: np.ndarray, q_start: int, q_len: int) -> float:
+        if q_start + q_len > M or q_len < 2:
+            return -np.inf
+        q_seg = q_tic[q_start:q_start + q_len]
+        if len(q_seg) != len(r_seg):
+            q_seg = np.interp(np.linspace(0, 1, len(r_seg)),
+                              np.linspace(0, 1, len(q_seg)), q_seg)
+        sr, sq = np.std(r_seg), np.std(q_seg)
+        if sr < 1e-8 or sq < 1e-8:
+            return 0.0
+        return float(np.corrcoef(r_seg, q_seg)[0, 1])
+
+    ref_segs = [ref_tic[i * T:(i + 1) * T] for i in range(N)]
+
+    INF = -1e9
+    dp_score = np.full(M + 1, INF)
+    dp_score[0] = 0.0
+    # Store one prev-pointer array per segment so traceback spans all N layers
+    all_prev = []
+
+    for i in range(N):
+        new_score = np.full(M + 1, INF)
+        new_prev  = np.full(M + 1, -1, dtype=int)
+        for b_prev in range(M + 1):
+            if dp_score[b_prev] == INF:
+                continue
+            for dq in range(max(1, T - slack), T + slack + 1):
+                b_next = b_prev + dq
+                if b_next > M:
+                    break
+                if i == N - 1 and b_next != M:
+                    continue
+                sc = dp_score[b_prev] + seg_corr(ref_segs[i], b_prev, dq)
+                if sc > new_score[b_next]:
+                    new_score[b_next] = sc
+                    new_prev[b_next]  = b_prev
+        dp_score = new_score
+        all_prev.append(new_prev)
+
+    # Traceback through all N layers to recover N+1 boundaries [0, b1, ..., M]
+    boundaries = [M]
+    pos = M
+    for layer in reversed(all_prev):   # walk back through layers N-1 → 0
+        prev = layer[pos]
+        if prev < 0:
+            return query.copy()
+        boundaries.append(prev)
+        pos = prev
+    boundaries = list(reversed(boundaries))   # [0, b1, ..., b_{N-1}, M]
+
+    # ref boundary i corresponds to i * T bins; query boundary is boundaries[i]
+    ref_pts = [i * T * BIN_MIN for i in range(N + 1)]   # N+1 points
+    q_pts   = [b * BIN_MIN     for b in boundaries]      # N+1 points
+
     for i in range(1, len(q_pts)):
         if q_pts[i] <= q_pts[i - 1]:
             q_pts[i] = q_pts[i - 1] + 0.01
 
-    warp_fn = interp1d(ref_pts, q_pts, kind='linear',
-                       bounds_error=False, fill_value='extrapolate')
-    return _warp_chroma(query, warp_fn)
+    warp = interp1d(ref_pts, q_pts, kind='linear',
+                    bounds_error=False, fill_value='extrapolate')
+    return _warp_chroma(query, warp)
 
 
-# ── Alignment method 3 & 4: m/z-anchored COW ─────────────────────────────────
+# ── m/z-anchored COW (our method) ────────────────────────────────────────────
 
 def align_mz_cow(query: np.ndarray, ref: np.ndarray,
-                  encode_fn=None,
-                  sim_threshold: float = 0.5,
-                  max_drift_min: float = 6.0) -> np.ndarray:
-    ref_pks = _detect_peaks(ref);   q_pks = _detect_peaks(query)
+                 encode_fn=None,
+                 sim_threshold: float = 0.5,
+                 max_drift_min: float = 6.0) -> np.ndarray:
+    """
+    COW guided by m/z fingerprint matching rather than TIC cross-correlation.
+    Uses raw cosine similarity or a learned encoder to match peaks, then
+    fits a piecewise-linear warp through the matched anchor pairs.
+    """
+    ref_pks = _detect_peaks(ref);  q_pks = _detect_peaks(query)
     ref_fps = np.array([_l2(ref[pk]) for pk in ref_pks])
     q_fps   = np.array([_l2(query[pk]) for pk in q_pks])
 
     ref_rep = encode_fn(ref_fps) if encode_fn else ref_fps
     q_rep   = encode_fn(q_fps)   if encode_fn else q_fps
 
-    sim = q_rep @ ref_rep.T
-    sim /= (np.linalg.norm(q_rep, axis=1, keepdims=True) *
-            np.linalg.norm(ref_rep, axis=1, keepdims=True).T + 1e-8)
+    ref_norm = np.linalg.norm(ref_rep, axis=1, keepdims=True) + 1e-8
+    q_norm   = np.linalg.norm(q_rep,   axis=1, keepdims=True) + 1e-8
+    sim      = (q_rep / q_norm) @ (ref_rep / ref_norm).T
 
     ref_t = ref_pks * BIN_MIN;  q_t = q_pks * BIN_MIN
     dm    = np.abs(q_t[:, None] - ref_t[None, :]) > max_drift_min
     sc    = sim.copy();  sc[dm] = -1.0
     ri, ci = linear_sum_assignment(-sc)
-    ms = sim[ri, ci]
-    keep = (ms >= sim_threshold) & ~dm[ri, ci]
+    keep   = (sim[ri, ci] >= sim_threshold) & ~dm[ri, ci]
     ri, ci = ri[keep], ci[keep]
 
     if len(ri) < 2:
@@ -221,54 +325,43 @@ def align_mz_cow(query: np.ndarray, ref: np.ndarray,
 
     rf = np.concatenate([[0], ra, [RUN_MIN]])
     qf = np.concatenate([[0], qa, [RUN_MIN]])
-    warp = interp1d(rf, qf, kind='linear', bounds_error=False, fill_value='extrapolate')
+    warp = interp1d(rf, qf, kind='linear',
+                    bounds_error=False, fill_value='extrapolate')
     return _warp_chroma(query, warp)
 
 
-# ── Apply alignment to all samples, save to temp .npz dir ────────────────────
+# ── Dataset helpers ───────────────────────────────────────────────────────────
 
 def build_aligned_dataset(chromas: list[np.ndarray],
                            npz_paths: list[Path],
                            align_fn,
                            out_dir: Path) -> list[Path]:
-    """
-    Apply align_fn(query, ref) to every sample and save aligned .npz files.
-    Returns list of output paths in the same order as npz_paths.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     ref = chromas[0]
     out_paths = []
-    for i, (chroma, src_path) in enumerate(zip(chromas, npz_paths)):
-        out_path = out_dir / src_path.name
-        if not out_path.exists():
+    for i, (chroma, src) in enumerate(zip(chromas, npz_paths)):
+        out = out_dir / src.name
+        if not out.exists():
             aligned = align_fn(chroma, ref) if i > 0 else chroma.copy()
-            np.savez_compressed(out_path, chroma=aligned)
-        out_paths.append(out_path)
+            np.savez_compressed(out, chroma=aligned)
+        out_paths.append(out)
     return out_paths
 
 
-# ── Max-projection features for classical baselines ──────────────────────────
-
-def max_proj_features(npz_paths: list[Path]) -> np.ndarray:
-    """Per-m/z maximum across all RT bins — (N, 1000) feature matrix."""
-    feats = []
-    for p in npz_paths:
-        chroma = np.load(p)['chroma'].astype(np.float32)   # (200, 1000)
-        feats.append(chroma.max(axis=0))
-    return np.stack(feats)
+def max_proj_features(paths: list[Path]) -> np.ndarray:
+    return np.stack([np.load(p)['chroma'].astype(np.float32).max(axis=0)
+                     for p in paths])
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # ── Load data ─────────────────────────────────────────────────────────
     npz_paths = sorted(FISH_CHROMA.glob('*.npz'))
     y         = np.load(DATA_DIR / 'fish_oil' / 'y.npy').astype(np.int64)
     chromas   = [np.load(p)['chroma'].astype(np.float32) for p in npz_paths]
     print(f"Loaded {len(chromas)} samples  |  classes: "
           f"{dict(zip(*np.unique(y, return_counts=True)))}")
 
-    # ── Load drift encoder for m/z COW ───────────────────────────────────
     drift_enc_fn = None
     drift_ckpt   = CKPT_DIR / 'drift_simclr.pt'
     if drift_ckpt.exists():
@@ -279,77 +372,70 @@ def main() -> None:
                 return m.encode(torch.from_numpy(x.astype('float32'))).numpy()
         print(f"Drift encoder loaded: {drift_ckpt.name}")
 
-    # ── Alignment conditions ──────────────────────────────────────────────
     tmp_root = Path(tempfile.mkdtemp(prefix='cow_dcnn_'))
     try:
-        align_methods = [
-            ('No alignment',         npz_paths,  None),
-        ]
+        align_methods = [('No alignment', npz_paths, None)]
 
         print("\nPre-computing aligned chromatograms …")
-        for name, fn in [
-            ('Global shift',          lambda q, r: align_global_shift(q, r)),
-            ('Segment shift',         lambda q, r: align_segment_shift(q, r)),
-            ('m/z COW (cosine)',      lambda q, r: align_mz_cow(q, r)),
-            ('m/z COW (drift enc.)',  lambda q, r: align_mz_cow(q, r, encode_fn=drift_enc_fn)),
-        ]:
-            tag     = name.replace(' ', '_').replace('/', '').replace('(', '').replace(')', '').replace('.', '')
+        named_fns = [
+            ('Co-shift [Savorani 2010]',
+             lambda q, r: align_coshift(q, r)),
+            ('icoshift [Savorani 2010]',
+             lambda q, r: align_icoshift(q, r)),
+            ('COW [Nielsen 1998]',
+             lambda q, r: align_cow(q, r)),
+            ('m/z COW (cosine)',
+             lambda q, r: align_mz_cow(q, r)),
+            ('m/z COW (drift enc.)',
+             lambda q, r: align_mz_cow(q, r, encode_fn=drift_enc_fn)),
+        ]
+        for name, fn in named_fns:
+            tag     = name.split('[')[0].strip().replace(' ', '_').replace('/', '').replace('(', '').replace(')', '').replace('.', '')
             out_dir = tmp_root / tag
             paths   = build_aligned_dataset(chromas, npz_paths, fn, out_dir)
             align_methods.append((name, paths, out_dir))
             print(f"  {name}: done")
 
-        # ── CNN model config ──────────────────────────────────────────────
-        cnn_cfg     = ChromaCNNConfig(mz_max=1000, cnn_channels=128,
-                                      kernel_size=7, num_classes=4, dropout=0.3)
         cnn_conditions = ['from_scratch']
         if CHROMA_CKPT.exists():
             cnn_conditions.append('chroma_pretrain')
-            print(f"\nPretrained checkpoint: {CHROMA_CKPT.name}")
-        else:
-            print("\nchroma_pretrain checkpoint not found — CNN from_scratch only")
 
-        # ── Run all conditions ────────────────────────────────────────────
         all_results: list[dict] = []
 
         for align_name, paths, _ in align_methods:
-            print(f"\n{'='*60}")
+            print(f"\n{'='*66}")
             print(f"Alignment: {align_name}")
-            print('='*60)
+            print('='*66)
 
-            # CNN conditions via ChromaFinetuner
             finetuner = ChromaFinetuner(CV_CFG, list(paths), y)
             for cond in cnn_conditions:
                 print(f"\n  CNN [{cond}] …")
                 res = finetuner.evaluate_condition(cond)
                 ba, f1 = res['balanced_accuracy'], res['macro_f1']
-                label = f"{align_name}  |  CNN {cond}"
                 print(f"    bal_acc={np.mean(ba):.3f}±{np.std(ba):.3f}  "
                       f"macro-F1={np.mean(f1):.3f}±{np.std(f1):.3f}")
-                all_results.append({'label': label, 'ba': ba, 'f1': f1})
+                all_results.append({'label': f"{align_name}  |  CNN {cond}",
+                                    'ba': ba, 'f1': f1})
 
-            # Classical baselines on max-projection features
-            X_feat = max_proj_features(list(paths))
-            for clf_name in ['plsda', 'rf']:
-                print(f"\n  {clf_name.upper()} …")
-                res = baseline_cv(X_feat, y, clf_name,
+            X = max_proj_features(list(paths))
+            for clf in ['plsda', 'rf']:
+                print(f"\n  {clf.upper()} …")
+                res = baseline_cv(X, y, clf,
                                   seeds=CV_CFG['task']['cv_seeds'],
                                   cv_strategy='kfold',
                                   cv_folds=CV_CFG['task']['cv_folds'])
                 ba, f1 = res['balanced_accuracy'], res['macro_f1']
-                label = f"{align_name}  |  {clf_name.upper()}"
                 print(f"    bal_acc={np.mean(ba):.3f}±{np.std(ba):.3f}  "
                       f"macro-F1={np.mean(f1):.3f}±{np.std(f1):.3f}")
-                all_results.append({'label': label, 'ba': ba, 'f1': f1})
+                all_results.append({'label': f"{align_name}  |  {clf.upper()}",
+                                    'ba': ba, 'f1': f1})
 
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
-    # ── Summary table ─────────────────────────────────────────────────────
-    print('\n' + '='*80)
-    print(f"{'Condition':<45}  {'Bal. Acc.':>14}  {'Macro-F1':>14}")
-    print('-'*80)
-
+    print('\n' + '='*86)
+    print(f"{'Condition':<52}  {'Bal. Acc.':>14}  {'Macro-F1':>14}")
+    print('-'*86)
     prev_align = None
     for r in all_results:
         align = r['label'].split('  |  ')[0]
@@ -358,11 +444,10 @@ def main() -> None:
                 print()
             prev_align = align
         ba = r['ba'];  f1 = r['f1']
-        print(f"{r['label']:<45}  "
+        print(f"{r['label']:<52}  "
               f"{np.mean(ba):.3f} ± {np.std(ba):.3f}  "
               f"{np.mean(f1):.3f} ± {np.std(f1):.3f}")
-
-    print('='*80)
+    print('='*86)
     print(f"5-fold × {len(CV_CFG['task']['cv_seeds'])} seeds = "
           f"{5 * len(CV_CFG['task']['cv_seeds'])} runs per condition")
     print("Classes: 0=SNA (snapper)  1=GUR (gurnard)  "
