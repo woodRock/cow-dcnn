@@ -2,12 +2,17 @@
 
 ![](meme.png)
 
-GC-MS chromatogram alignment via m/z fingerprint matching and deep metric learning.
+Does explicit retention time alignment improve downstream GC-MS classification
+when a pretrained chromatogram encoder is available?
 
 COW (Correlation Optimised Warping) guided by EI-MS compound identities rather than
 raw TIC signal. Each chromatogram peak carries a 1000-dim m/z fingerprint; peaks are
 matched across runs using cosine similarity (optionally lifted into a learned embedding
 space) and a piecewise-linear warp is fit through the matched anchor pairs.
+
+**Short answer:** no. A CNN pretrained via next-frame prediction on raw chromatograms
+achieves 0.964 balanced accuracy on fish species classification without any alignment,
+and every alignment method we tested degrades it.
 
 ## Method
 
@@ -26,6 +31,8 @@ Two pretraining strategies are evaluated as a drop-in replacement for raw cosine
 **SimCLR** (`pretrain_simclr.py`): contrastive pretraining on EI-MS spectra with spectral augmentation (Gaussian noise, random ion masking, intensity jitter). Stage 1 trains on 9,553 MoNA reference spectra for general EI-MS features; Stage 2 fine-tunes on chromatogram peak spectra from the target datasets.
 
 **Cross-sample drift encoder** (`pretrain_drift.py`): positive pairs are matched peak spectra from *different* GC-MS runs of the same dataset. Within fish_oil and mtbls288 separately, each sample is aligned to several reference chromatograms and the matched (ref_spectrum, query_spectrum) pairs are used as genuine same-compound observations with real inter-run spectral variation. Initialised from the MoNA SimCLR checkpoint.
+
+The downstream classifier uses **ChromatogramCNN** from the [chroma-dcnn](https://github.com/woodRock/chroma-dcnn) package, pretrained via next-frame prediction on raw chromatograms. This pretraining objective — predict the m/z spectrum at bin *t+1* given all preceding bins — teaches the model the temporal covariance structure of GC-MS elution without any alignment supervision.
 
 ## Data setup
 
@@ -106,6 +113,8 @@ Evaluates all available checkpoints on within-study (fish_oil 103×103) and cros
 
 ## Results
 
+### Alignment quality (TIC correlation)
+
 | Method | Within-study (fish\_oil) | Cross-study (fish\_oil × mtbls288) |
 |---|---|---|
 | Unaligned | 0.564 | 0.161 |
@@ -114,15 +123,42 @@ Evaluates all available checkpoints on within-study (fish_oil 103×103) and cros
 | Drift encoder | **0.675** | 0.162 |
 
 The drift encoder (trained on 8,081 real cross-sample matched peak pairs) achieves
-the best within-study alignment, outperforming both raw cosine similarity and the
-augmentation-only SimCLR encoder.
+the best within-study alignment. Cross-study alignment does not improve meaningfully
+(0.161 → 0.162): fish_oil and MTBLS288 have different compound profiles, not merely
+shifted retention times.
 
-Cross-study alignment is an open problem: fish_oil and MTBLS288 have genuinely
-different compound profiles (different biological matrices, different labs) rather
-than merely shifted retention times. No method improves meaningfully beyond the
-unaligned baseline (0.161 → 0.162). Bridging this gap requires cross-study
-supervision — labelled peak pairs, shared internal standards, or matched reference
-compounds present in both datasets.
+### Downstream classification (fish species, 4-class, 5-fold × 3 seeds)
+
+Metric: balanced accuracy (mean ± std over 15 runs). Classifiers evaluated on
+ChromatogramCNN (pretrained / from scratch) and classical baselines (PLS-DA, RF)
+on the per-m/z max-projection feature vector.
+
+| Alignment | CNN (pretrained) | CNN (from scratch) | PLS-DA | RF |
+|---|---|---|---|---|
+| No alignment | **0.964 ± 0.072** | 0.679 ± 0.196 | 0.325 ± 0.101 | 0.363 ± 0.076 |
+| Global shift | 0.950 ± 0.124 | **0.761 ± 0.171** | 0.311 ± 0.099 | 0.363 ± 0.096 |
+| Segment shift | 0.901 ± 0.146 | 0.615 ± 0.162 | 0.339 ± 0.082 | 0.355 ± 0.059 |
+| m/z COW (cosine) | 0.853 ± 0.129 | 0.681 ± 0.220 | 0.333 ± 0.083 | 0.391 ± 0.074 |
+| m/z COW (drift enc.) | 0.856 ± 0.133 | 0.717 ± 0.139 | 0.329 ± 0.086 | **0.411 ± 0.078** |
+
+**Key finding:** the pretrained CNN achieves 0.964 balanced accuracy *without* any
+alignment, and every alignment method degrades it monotonically
+(0.964 → 0.950 → 0.901 → 0.853). The pretrained model was trained on raw,
+unaligned chromatograms; post-hoc warping takes chromatograms out of that
+distribution and introduces artefacts the model was never exposed to during
+next-frame prediction pretraining.
+
+For models without pretraining, alignment offers a modest benefit (0.679 → 0.761 with
+a global shift), but the gap between pretrained and from-scratch is far larger than
+any alignment gain. Classical methods (PLS-DA, RF) remain poor regardless of
+alignment; the per-m/z max-projection feature is a coarse representation that
+discards temporal structure.
+
+**Limitations.** Results are from a single dataset (103 fish oil samples). The
+classical baselines may be disadvantaged by the choice of max-projection features
+rather than a conventional aligned peak table. The chroma-dcnn pretrained checkpoint
+should be verified as trained independently of the fish oil evaluation data to rule
+out distribution leakage.
 
 ## Exploration
 
