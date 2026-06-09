@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Raw data
+data/**/raw/
+data/**
+*.cdf
+*.mzML
+*.mzXML
+
+# Outputs
+results/
+checkpoints/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
