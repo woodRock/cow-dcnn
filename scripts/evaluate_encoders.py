@@ -126,7 +126,8 @@ def _load_encoder(path: Path):
     m.eval()
     def encode_fn(x: np.ndarray) -> np.ndarray:
         with torch.no_grad():
-            return m.encode(torch.from_numpy(x.astype('float32'))).numpy()
+            t = torch.from_numpy(x.astype('float32')).to(DEVICE)
+            return m.encode(t).cpu().numpy()
     return encode_fn
 
 
