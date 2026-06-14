@@ -300,16 +300,11 @@ def train(device, n_iterations: int = N_ITERATIONS, batch_size: int = BATCH_SIZE
         emb_a = model.encode(fps_a_t, rts_a_t)   # (P, N_TOTAL, 128)
         emb_b = model.encode(fps_b_t, rts_b_t)
 
-        # Collect shared-peak embeddings from all chromatogram pairs
-        z1_parts, z2_parts = [], []
-        for i in range(N_PAIRS_PER_ITER):
-            si_a = torch.from_numpy(masks_a[i]).to(device)
-            si_b = torch.from_numpy(masks_b[i]).to(device)
-            z1_parts.append(emb_a[i][si_a])
-            z2_parts.append(emb_b[i][si_b])
-
-        z1 = torch.cat(z1_parts, dim=0)[:batch_size]   # (B, 128)
-        z2 = torch.cat(z2_parts, dim=0)[:batch_size]
+        # Vectorised extraction of shared-peak embeddings (one MPS op, not P small ones)
+        ma = torch.from_numpy(masks_a).to(device)   # (P, N_TOTAL) bool
+        mb = torch.from_numpy(masks_b).to(device)
+        z1 = emb_a[ma][:batch_size]   # (B, 128) — shared peaks across all pairs
+        z2 = emb_b[mb][:batch_size]
 
         loss = nt_xent_loss(model.project(z1), model.project(z2))
         opt.zero_grad(); loss.backward(); opt.step()

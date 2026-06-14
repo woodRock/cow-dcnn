@@ -43,18 +43,25 @@ class SpectrumEncoder(nn.Module):
 
 
 class _DilatedResBlock(nn.Module):
-    """Two dilated conv layers with a residual skip and GELU activation."""
-    def __init__(self, channels: int, dilation: int, kernel_size: int = 3):
+    """Two dilated conv layers with a residual skip and GELU activation.
+
+    norm_fn: factory callable (channels) → normalisation module.
+    Defaults to BatchNorm1d; pass `lambda c: nn.GroupNorm(8, c)` for MPS compat.
+    """
+    def __init__(self, channels: int, dilation: int, kernel_size: int = 3,
+                 norm_fn=None):
         super().__init__()
+        if norm_fn is None:
+            norm_fn = nn.BatchNorm1d
         pad = (kernel_size - 1) * dilation // 2   # 'same' padding for odd kernels
         self.net = nn.Sequential(
             nn.Conv1d(channels, channels, kernel_size,
                       dilation=dilation, padding=pad, bias=False),
-            nn.BatchNorm1d(channels),
+            norm_fn(channels),
             nn.GELU(),
             nn.Conv1d(channels, channels, kernel_size,
                       dilation=dilation, padding=pad, bias=False),
-            nn.BatchNorm1d(channels),
+            norm_fn(channels),
         )
         self.act = nn.GELU()
 
@@ -341,7 +348,7 @@ class PeakSequenceTransformer(nn.Module):
         fps : (B, N, 1000)  L2-normalised m/z fingerprints for N peaks (ascending RT)
         rts : (B, N)        normalised retention times in [0, 1]
 
-    Step 1 — m/z encoding: shared dilated CNN applied per peak → (B, N, channels)
+    Step 1 — m/z encoding: 2-layer MLP per peak (1000 → d_model), MPS-friendly
     Step 2 — RT positional encoding: sinusoidal at continuous RT value, added to tokens
     Step 3 — Transformer encoder: self-attention over all N peaks
     Step 4 — Head: Linear → (B, N, emb_dim), L2-normalised
@@ -351,23 +358,21 @@ class PeakSequenceTransformer(nn.Module):
     """
 
     def __init__(self, in_dim: int = 1000, emb_dim: int = 128,
-                 channels: int = 64, d_model: int = 64,
-                 nhead: int = 4, n_layers: int = 2, dropout: float = 0.1):
+                 d_model: int = 128, nhead: int = 4,
+                 n_layers: int = 2, dropout: float = 0.1):
         super().__init__()
 
-        # m/z encoder: same dilated CNN as DilatedSpectrumEncoder, weights shared per peak
-        self.mz_stem = nn.Sequential(
-            nn.Conv1d(1, channels, kernel_size=7, padding=3, bias=False),
-            nn.BatchNorm1d(channels),
+        # m/z encoder: lightweight MLP per peak — two matrix multiplications,
+        # trivially fast on MPS/CPU regardless of batch size.
+        # (The dilated CNN that DilatedSpectrumEncoder uses is ~300x slower on MPS
+        #  because MPS is poorly optimised for 1D dilated convs over 1000-dim input.)
+        self.mz_encoder = nn.Sequential(
+            nn.Linear(in_dim, d_model * 2),
+            nn.LayerNorm(d_model * 2),
             nn.GELU(),
-        )
-        self.mz_blocks = nn.Sequential(
-            _DilatedResBlock(channels, dilation=1),
-            _DilatedResBlock(channels, dilation=2),
-            _DilatedResBlock(channels, dilation=4),
-            _DilatedResBlock(channels, dilation=8),
-            _DilatedResBlock(channels, dilation=16),
-            _DilatedResBlock(channels, dilation=32),
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
         )
 
         # Sinusoidal RT positional encoding (continuous, not discrete bin index)
@@ -375,8 +380,6 @@ class PeakSequenceTransformer(nn.Module):
             torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)
         )
         self.register_buffer('_div_term', div)   # (d_model//2,)
-
-        self.mz_to_d = nn.Identity() if channels == d_model else nn.Linear(channels, d_model)
 
         # Pre-LN Transformer over the N-peak sequence (batch_first for clean (B,N,d) layout)
         enc_layer = nn.TransformerEncoderLayer(
@@ -405,23 +408,13 @@ class PeakSequenceTransformer(nn.Module):
             torch.cos(rts * self._div_term),               # (B, N, d//2)
         ], dim=-1)
 
-    def _encode_mz(self, fps: torch.Tensor) -> torch.Tensor:
-        """Shared dilated CNN applied per peak. fps: (B, N, 1000) → (B, N, channels)."""
-        B, N, L = fps.shape
-        h = fps.reshape(B * N, L).unsqueeze(1)   # (B·N, 1, 1000)
-        h = self.mz_stem(h)                       # (B·N, C, 1000)
-        h = self.mz_blocks(h)                     # (B·N, C, 1000)
-        h = h.mean(dim=-1)                        # (B·N, C) — global avg pool over m/z
-        return h.reshape(B, N, -1)                # (B, N, C)
-
     def encode(self, fps: torch.Tensor, rts: torch.Tensor) -> torch.Tensor:
         """
         fps : (B, N, 1000) — L2-normalised m/z fingerprints (sorted by ascending RT)
         rts : (B, N)       — normalised RT positions in [0, 1]
         → (B, N, emb_dim) L2-normalised per-peak embeddings, globally context-aware
         """
-        h = self._encode_mz(fps)                # (B, N, C)
-        h = self.mz_to_d(h)                     # (B, N, d_model)
+        h = self.mz_encoder(fps)                # (B, N, d_model)
         h = h + self._rt_pe(rts)               # add RT positional encoding
         h = self.transformer(h)                 # (B, N, d_model) — global self-attention
         h = self.drop(h)
