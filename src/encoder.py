@@ -1,6 +1,12 @@
 """
-MLP encoder for GC-MS m/z spectra, trained with SimCLR.
-The 128-dim embeddings replace raw cosine similarity in the alignment pipeline.
+Encoders for GC-MS m/z spectra, trained with SimCLR.
+
+SpectrumEncoder       — 3-layer MLP (kept for gcms_simclr.pt / mona_simclr.pt compat)
+DilatedSpectrumEncoder — 1-D dilated-CNN (drift_simclr.pt)
+
+Both expose the same interface:
+  encode(x)   → L2-normalised (B, emb_dim) embedding   [inference]
+  forward(x)  → L2-normalised (B, 64) projected head   [SimCLR training]
 """
 
 import torch
@@ -16,19 +22,210 @@ class SpectrumEncoder(nn.Module):
             nn.Linear(512, 256),    nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(256, emb_dim),
         )
-        # Projection head used during SimCLR training only
         self.proj = nn.Sequential(
             nn.Linear(emb_dim, emb_dim), nn.ReLU(),
             nn.Linear(emb_dim, 64),
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Return L2-normalised embedding. Shape: (B, emb_dim)."""
         return F.normalize(self.encoder(x), dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return projected embedding for SimCLR loss. Shape: (B, 64)."""
         return F.normalize(self.proj(self.encode(x)), dim=-1)
+
+
+class _DilatedResBlock(nn.Module):
+    """Two dilated conv layers with a residual skip and GELU activation."""
+    def __init__(self, channels: int, dilation: int, kernel_size: int = 3):
+        super().__init__()
+        pad = (kernel_size - 1) * dilation // 2   # 'same' padding for odd kernels
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size,
+                      dilation=dilation, padding=pad, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size,
+                      dilation=dilation, padding=pad, bias=False),
+            nn.BatchNorm1d(channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.net(x))
+
+
+class DilatedSpectrumEncoder(nn.Module):
+    """
+    1-D dilated CNN encoder for GC-MS m/z spectra.
+
+    Treats the 1000-dim L2-normalised spectrum as a 1D signal over the m/z
+    axis.  Dilated residual blocks capture structure at multiple scales:
+      dilation 1-2   → isotope clusters (2-6 Da)
+      dilation 4-8   → neutral losses (CO=28, H2O=18, common fragments)
+      dilation 16-32 → compound-class signatures spanning 50-100+ Da
+
+    The effective receptive field after 6 blocks (dilations 1→32, k=3) is
+    2 × (1+2+4+8+16+32) × (3-1) = 252 m/z units per layer pair, or ~378 Da
+    total — enough to see the full fragment fingerprint of most GC-MS compounds.
+
+    RT conditioning: optional normalised retention time (0–1) is injected as
+    an additive bias to the global-average-pooled feature map before the head,
+    so the embedding encodes both spectral identity and chromatographic position.
+
+    Parameter count: ~636 K
+    """
+    def __init__(self, in_dim: int = 1000, emb_dim: int = 128,
+                 channels: int = 64, dropout: float = 0.1):
+        super().__init__()
+        # Stem: pointwise projection into channel space
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, channels, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        # Six dilated residual blocks; dilation doubles each block
+        self.blocks = nn.Sequential(
+            _DilatedResBlock(channels, dilation=1),
+            _DilatedResBlock(channels, dilation=2),
+            _DilatedResBlock(channels, dilation=4),
+            _DilatedResBlock(channels, dilation=8),
+            _DilatedResBlock(channels, dilation=16),
+            _DilatedResBlock(channels, dilation=32),
+        )
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Linear(channels, emb_dim)
+        # RT conditioning: scalar position → additive feature bias
+        self.rt_proj = nn.Linear(1, channels)
+        # SimCLR projection head (discarded at inference)
+        self.proj = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim), nn.ReLU(),
+            nn.Linear(emb_dim, 64),
+        )
+
+    def encode(self, x: torch.Tensor,
+               rt: torch.Tensor = None) -> torch.Tensor:
+        """Return L2-normalised embedding. Shape: (B, emb_dim).
+
+        rt: optional (B,) tensor of normalised retention time in [0, 1].
+            When provided, the embedding encodes both spectral identity and
+            chromatographic position — peaks at very different RT positions
+            will be further apart in embedding space even with similar spectra.
+        """
+        h = x.unsqueeze(1)        # (B, 1, L)
+        h = self.stem(h)          # (B, C, L)
+        h = self.blocks(h)        # (B, C, L)
+        h = h.mean(dim=-1)        # (B, C) — global average pool
+        if rt is not None:
+            h = h + self.rt_proj(rt.view(-1, 1).float())   # (B, C)
+        h = self.drop(h)
+        return F.normalize(self.head(h), dim=-1)
+
+    def forward(self, x: torch.Tensor,
+                rt: torch.Tensor = None) -> torch.Tensor:
+        """Return projected embedding for SimCLR loss. Shape: (B, 64)."""
+        return F.normalize(self.proj(self.encode(x, rt)), dim=-1)
+
+
+class SparseSpectrumTransformer(nn.Module):
+    """
+    Sparse transformer encoder for GC-MS EI mass spectra.
+
+    Rather than treating the 1000-dim spectrum as a dense 1D signal, extracts
+    the top max_peaks m/z bins as tokens.  Each token is the learned m/z
+    positional embedding scaled by the observed intensity, so the sequence
+    length is ~50–200 tokens instead of 1000 — making full self-attention
+    tractable and naturally sparse.
+
+    Self-attention captures non-local fragment relationships that a dilated CNN
+    can only approximate with a finite receptive field:
+      • molecular ion ↔ neutral-loss fragments (M-15, M-18, M-28, M-CO)
+      • compound-class signatures spanning the full m/z range
+        (e.g. FAME series: 74, 87, M-31, M-59; steroids: 55, 69, 83 …)
+
+    Architecture: Pre-LN transformer (more stable than Post-LN on small data)
+    Defaults: d_model=64, nhead=4, n_layers=3, dim_ff=128  → ~198 K params.
+    Same interface as DilatedSpectrumEncoder:
+      encode(x, rt=None)  → (B, emb_dim)  L2-normed
+      forward(x, rt=None) → (B, 64)       SimCLR projection head
+    """
+
+    def __init__(self, mz_vocab: int = 1000, d_model: int = 64,
+                 nhead: int = 4, n_layers: int = 3, dim_ff: int = 128,
+                 dropout: float = 0.1, max_peaks: int = 128,
+                 emb_dim: int = 128):
+        super().__init__()
+        self.max_peaks = max_peaks
+
+        # Learned m/z positional embeddings — one per m/z bin 0 … 999
+        self.mz_embed = nn.Embedding(mz_vocab, d_model)
+
+        # [CLS] token — pooled to produce the spectrum-level embedding
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        # Pre-LN transformer encoder (norm_first=True)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            enc_layer, num_layers=n_layers, norm=nn.LayerNorm(d_model),
+        )
+
+        # Optional RT conditioning — additive bias on CLS output
+        self.rt_proj = nn.Linear(1, d_model)
+
+        # Output head: d_model → emb_dim
+        self.head = nn.Linear(d_model, emb_dim)
+
+        # SimCLR projection head (discarded at inference)
+        self.proj = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim), nn.ReLU(),
+            nn.Linear(emb_dim, 64),
+        )
+
+    def _tokenise(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert dense (B, 1000) spectra to sparse (B, max_peaks, d_model) tokens.
+
+        Top-max_peaks bins are selected by intensity; each token is the learned
+        m/z embedding scaled by its intensity (low-intensity fragments contribute
+        less; near-zero padding bins are zeroed and masked).
+
+        Returns:
+          tokens:   (B, max_peaks, d_model)
+          key_mask: (B, max_peaks) bool — True = padding, excluded from attention
+        """
+        vals, idxs = x.topk(self.max_peaks, dim=-1, sorted=False)  # (B, P)
+        key_mask   = vals < 1e-6                                     # near-zero → pad
+        tokens     = self.mz_embed(idxs) * vals.unsqueeze(-1)       # (B, P, d_model)
+        tokens     = tokens.masked_fill(key_mask.unsqueeze(-1), 0.0)
+        return tokens, key_mask
+
+    def encode(self, x: torch.Tensor,
+               rt: torch.Tensor = None) -> torch.Tensor:
+        """Return L2-normalised (B, emb_dim) embedding."""
+        B = x.size(0)
+        tokens, key_mask = self._tokenise(x)            # (B, P, d), (B, P)
+
+        # Prepend [CLS]; its mask entry is always False (never padding)
+        cls     = self.cls_token.expand(B, -1, -1)      # (B, 1, d)
+        seq     = torch.cat([cls, tokens], dim=1)        # (B, 1+P, d)
+        cls_pad = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
+        mask    = torch.cat([cls_pad, key_mask], dim=1)  # (B, 1+P)
+
+        out = self.transformer(seq, src_key_padding_mask=mask)  # (B, 1+P, d)
+        h   = out[:, 0]                                          # [CLS] → (B, d)
+
+        if rt is not None:
+            h = h + self.rt_proj(rt.view(-1, 1).float())
+
+        return F.normalize(self.head(h), dim=-1)
+
+    def forward(self, x: torch.Tensor,
+                rt: torch.Tensor = None) -> torch.Tensor:
+        """Return projected embedding for SimCLR loss. Shape: (B, 64)."""
+        return F.normalize(self.proj(self.encode(x, rt)), dim=-1)
 
 
 def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:

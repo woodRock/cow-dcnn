@@ -30,12 +30,12 @@ import sys
 import numpy as np
 import torch
 from pathlib import Path
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.optimize import linear_sum_assignment
 from scipy.signal import find_peaks as sp_find_peaks
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-from encoder import SpectrumEncoder
+from encoder import DilatedSpectrumEncoder, SparseSpectrumTransformer
 
 DATA_DIR    = Path(__file__).parent.parent / 'data'
 CKPT_DIR    = Path(__file__).parent.parent / 'checkpoints'
@@ -72,10 +72,17 @@ def _detect_peaks(chroma: np.ndarray) -> np.ndarray:
     tic = chroma.sum(axis=1)
     thr = np.percentile(tic, 80)
     pks, props = sp_find_peaks(tic, height=thr, distance=5)
-    if len(pks) > 15:
-        top = np.argsort(props['peak_heights'])[-15:]
+    if len(pks) > 30:
+        top = np.argsort(props['peak_heights'])[-30:]
         pks = pks[top]
     return np.sort(pks)
+
+
+def _context_fp(chroma: np.ndarray, pk: int) -> np.ndarray:
+    """Mean m/z spectrum over [pk-1, pk, pk+1], L2-normalised."""
+    lo = max(0, pk - 1)
+    hi = min(chroma.shape[0], pk + 2)
+    return _l2(chroma[lo:hi].mean(axis=0))
 
 
 def _apply_int_shift(signal: np.ndarray, lag: int) -> np.ndarray:
@@ -180,32 +187,78 @@ def align_cow(query: np.ndarray, ref: np.ndarray,
 
 
 def align_mz_cow(query: np.ndarray, ref: np.ndarray,
-                 encode_fn=None, sim_threshold: float = 0.5,
+                 encode_fn=None,
                  max_drift_min: float = 6.0) -> np.ndarray:
-    ref_pks = _detect_peaks(ref);  q_pks = _detect_peaks(query)
-    ref_fps = np.array([_l2(ref[pk])   for pk in ref_pks])
-    q_fps   = np.array([_l2(query[pk]) for pk in q_pks])
-    ref_rep = encode_fn(ref_fps) if encode_fn else ref_fps
-    q_rep   = encode_fn(q_fps)   if encode_fn else q_fps
+    ref_pks = _detect_peaks(ref)
+    q_pks   = _detect_peaks(query)
+    # Context fingerprints: ±1-bin average reduces single-bin noise
+    ref_fps = np.array([_context_fp(ref,   pk) for pk in ref_pks])
+    q_fps   = np.array([_context_fp(query, pk) for pk in q_pks])
+    # RT-aware encoding: pass normalised peak positions alongside spectra
+    ref_rts = ref_pks.astype(np.float32) / N_BINS
+    q_rts   = q_pks.astype(np.float32) / N_BINS
+    if encode_fn:
+        ref_rep = encode_fn(ref_fps, ref_rts)
+        q_rep   = encode_fn(q_fps,   q_rts)
+    else:
+        ref_rep, q_rep = ref_fps, q_fps
     ref_n = np.linalg.norm(ref_rep, axis=1, keepdims=True) + 1e-8
     q_n   = np.linalg.norm(q_rep,   axis=1, keepdims=True) + 1e-8
     sim   = (q_rep / q_n) @ (ref_rep / ref_n).T
-    ref_t = ref_pks * BIN_MIN;  q_t = q_pks * BIN_MIN
+    ref_t = ref_pks * BIN_MIN
+    q_t   = q_pks   * BIN_MIN
     dm    = np.abs(q_t[:, None] - ref_t[None, :]) > max_drift_min
-    sc    = sim.copy();  sc[dm] = -1.0
+    sc    = sim.copy()
+    sc[dm] = -1.0
     ri, ci = linear_sum_assignment(-sc)
-    keep   = (sim[ri, ci] >= sim_threshold) & ~dm[ri, ci]
+    # Adaptive threshold: top-30% of within-window similarities
+    avail = sim[~dm].flatten()
+    threshold = max(float(np.percentile(avail, 70)), 0.30) if len(avail) >= 3 else 0.35
+    keep   = (sim[ri, ci] >= threshold) & ~dm[ri, ci]
     ri, ci = ri[keep], ci[keep]
-    if len(ri) < 2: return query.copy()
-    order = np.argsort(ci);  ri, ci = ri[order], ci[order]
-    ra = TIME_AX[ref_pks[ci]];  qa = TIME_AX[q_pks[ri]]
+    if len(ri) < 2:
+        return query.copy()
+    # Fine-tune each anchor: search ±3 bins for best spectral match
+    refined_q = []
+    for idx in range(len(ri)):
+        r_spec = ref_fps[ci[idx]]
+        q_pk   = q_pks[ri[idx]]
+        best_bin, best_s = q_pk, np.dot(r_spec, _context_fp(query, q_pk))
+        for delta in range(-3, 4):
+            if delta == 0:
+                continue
+            cand = int(np.clip(q_pk + delta, 0, N_BINS - 1))
+            s = np.dot(r_spec, _context_fp(query, cand))
+            if s > best_s:
+                best_s = s
+                best_bin = cand
+        refined_q.append(best_bin)
+    refined_q = np.array(refined_q)
+    order = np.argsort(ci)
+    ri, ci, refined_q = ri[order], ci[order], refined_q[order]
+    ra = TIME_AX[ref_pks[ci]]
+    qa = TIME_AX[refined_q]
+    # RANSAC: reject anchors that deviate from the main linear RT drift trend
+    if len(ra) >= 4:
+        from sklearn.linear_model import RANSACRegressor
+        try:
+            ransac = RANSACRegressor(residual_threshold=3 * BIN_MIN,
+                                     min_samples=2, random_state=42)
+            ransac.fit(qa.reshape(-1, 1), ra)
+            if ransac.inlier_mask_.sum() >= 2:
+                ra = ra[ransac.inlier_mask_]
+                qa = qa[ransac.inlier_mask_]
+        except Exception:
+            pass
     mono = [0]
     for i in range(1, len(qa)):
-        if qa[i] > qa[mono[-1]]: mono.append(i)
+        if qa[i] > qa[mono[-1]]:
+            mono.append(i)
     ra, qa = ra[mono], qa[mono]
     rf = np.concatenate([[0], ra, [RUN_MIN]])
     qf = np.concatenate([[0], qa, [RUN_MIN]])
-    warp = interp1d(rf, qf, kind='linear', bounds_error=False, fill_value='extrapolate')
+    # PCHIP: monotone cubic interpolation — smooth warp, no kinks at anchor points
+    warp = PchipInterpolator(rf, qf)
     return _warp_chroma(query, warp)
 
 
@@ -264,21 +317,37 @@ def main() -> None:
     drift_enc_fn = None
     drift_ckpt   = CKPT_DIR / 'drift_simclr.pt'
     if drift_ckpt.exists():
-        m = SpectrumEncoder().to('cpu')
+        m = DilatedSpectrumEncoder().to('cpu')
         m.load_state_dict(torch.load(drift_ckpt, map_location='cpu'))
         m.eval()
-        def drift_enc_fn(x: np.ndarray) -> np.ndarray:
+        def drift_enc_fn(x: np.ndarray, rt: np.ndarray = None) -> np.ndarray:
             with torch.no_grad():
-                return m.encode(torch.from_numpy(x.astype('float32'))).numpy()
+                t = torch.from_numpy(x.astype('float32'))
+                r = torch.from_numpy(rt.astype('float32')) if rt is not None else None
+                return m.encode(t, r).numpy()
         print(f"Drift encoder loaded from {drift_ckpt.name}")
 
+    transformer_enc_fn = None
+    transformer_ckpt   = CKPT_DIR / 'transformer_simclr.pt'
+    if transformer_ckpt.exists():
+        mt = SparseSpectrumTransformer().to('cpu')
+        mt.load_state_dict(torch.load(transformer_ckpt, map_location='cpu'))
+        mt.eval()
+        def transformer_enc_fn(x: np.ndarray, rt: np.ndarray = None) -> np.ndarray:
+            with torch.no_grad():
+                t = torch.from_numpy(x.astype('float32'))
+                r = torch.from_numpy(rt.astype('float32')) if rt is not None else None
+                return mt.encode(t, r).numpy()
+        print(f"Transformer encoder loaded from {transformer_ckpt.name}")
+
     align_methods = [
-        ('No alignment',           None),
-        ('Co-shift',               align_coshift),
-        ('icoshift',               align_icoshift),
-        ('COW',                    align_cow),
-        ('m/z COW (cosine)',       lambda q, r: align_mz_cow(q, r)),
-        ('m/z COW (drift enc.)',   lambda q, r: align_mz_cow(q, r, encode_fn=drift_enc_fn)),
+        ('No alignment',              None),
+        ('Co-shift',                  align_coshift),
+        ('icoshift',                  align_icoshift),
+        ('COW',                       align_cow),
+        ('m/z COW (cosine)',          lambda q, r: align_mz_cow(q, r)),
+        ('m/z COW (drift enc.)',      lambda q, r: align_mz_cow(q, r, encode_fn=drift_enc_fn)),
+        ('m/z COW (transformer)',     lambda q, r: align_mz_cow(q, r, encode_fn=transformer_enc_fn)),
     ]
 
     results = []
@@ -309,8 +378,8 @@ def main() -> None:
                         'mean': mean_cv, 'good_pct': good_pct})
 
     # Per-class breakdown for reference (no alignment vs best method)
-    print(f"\n── Per-class median CV  [No alignment vs best method] ────────────────────")
-    for name, align_fn in [align_methods[0], align_methods[-1]]:
+    print(f"\n── Per-class median CV  [No alignment vs Co-shift] ────────────────────")
+    for name, align_fn in [align_methods[0], align_methods[1]]:
         if align_fn is None:
             aligned = chromas
         else:

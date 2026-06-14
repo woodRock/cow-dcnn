@@ -41,14 +41,14 @@ import shutil
 import numpy as np
 import torch
 from pathlib import Path
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.optimize import linear_sum_assignment
 from scipy.signal import find_peaks as sp_find_peaks
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 sys.path.insert(0, '/Users/woodj/Desktop/chroma-dcnn/src')
 
-from encoder import SpectrumEncoder
+from encoder import DilatedSpectrumEncoder
 from chroma_dcnn.models.chroma_cnn import ChromaCNNConfig
 from chroma_dcnn.training.finetune_chroma import ChromaFinetuner
 from chroma_dcnn.evaluation.baselines import baseline_cv
@@ -111,10 +111,16 @@ def _detect_peaks(chroma: np.ndarray) -> np.ndarray:
     tic = chroma.sum(axis=1)
     thr = np.percentile(tic, 80)
     pks, props = sp_find_peaks(tic, height=thr, distance=5)
-    if len(pks) > 15:
-        top = np.argsort(props['peak_heights'])[-15:]
+    if len(pks) > 30:
+        top = np.argsort(props['peak_heights'])[-30:]
         pks = pks[top]
     return np.sort(pks)
+
+
+def _context_fp(chroma: np.ndarray, pk: int) -> np.ndarray:
+    lo = max(0, pk - 1)
+    hi = min(chroma.shape[0], pk + 2)
+    return _l2(chroma[lo:hi].mean(axis=0))
 
 
 def _warp_chroma(query: np.ndarray, warp_fn) -> np.ndarray:
@@ -295,47 +301,54 @@ def align_cow(query: np.ndarray, ref: np.ndarray,
 
 def align_mz_cow(query: np.ndarray, ref: np.ndarray,
                  encode_fn=None,
-                 sim_threshold: float = 0.5,
+                 sim_threshold: float = 0.40,
                  max_drift_min: float = 6.0) -> np.ndarray:
-    """
-    COW guided by m/z fingerprint matching rather than TIC cross-correlation.
-    Uses raw cosine similarity or a learned encoder to match peaks, then
-    fits a piecewise-linear warp through the matched anchor pairs.
-    """
-    ref_pks = _detect_peaks(ref);  q_pks = _detect_peaks(query)
-    ref_fps = np.array([_l2(ref[pk]) for pk in ref_pks])
-    q_fps   = np.array([_l2(query[pk]) for pk in q_pks])
-
+    ref_pks = _detect_peaks(ref)
+    q_pks   = _detect_peaks(query)
+    ref_fps = np.array([_context_fp(ref,   pk) for pk in ref_pks])
+    q_fps   = np.array([_context_fp(query, pk) for pk in q_pks])
     ref_rep = encode_fn(ref_fps) if encode_fn else ref_fps
     q_rep   = encode_fn(q_fps)   if encode_fn else q_fps
-
     ref_norm = np.linalg.norm(ref_rep, axis=1, keepdims=True) + 1e-8
     q_norm   = np.linalg.norm(q_rep,   axis=1, keepdims=True) + 1e-8
     sim      = (q_rep / q_norm) @ (ref_rep / ref_norm).T
-
-    ref_t = ref_pks * BIN_MIN;  q_t = q_pks * BIN_MIN
+    ref_t = ref_pks * BIN_MIN
+    q_t   = q_pks   * BIN_MIN
     dm    = np.abs(q_t[:, None] - ref_t[None, :]) > max_drift_min
-    sc    = sim.copy();  sc[dm] = -1.0
+    sc    = sim.copy()
+    sc[dm] = -1.0
     ri, ci = linear_sum_assignment(-sc)
     keep   = (sim[ri, ci] >= sim_threshold) & ~dm[ri, ci]
     ri, ci = ri[keep], ci[keep]
-
     if len(ri) < 2:
         return query.copy()
-
-    order = np.argsort(ci);  ri, ci = ri[order], ci[order]
-    ra = TIME_AX[ref_pks[ci]];  qa = TIME_AX[q_pks[ri]]
-
+    refined_q = []
+    for idx in range(len(ri)):
+        r_spec = ref_fps[ci[idx]]
+        q_pk   = q_pks[ri[idx]]
+        best_bin, best_s = q_pk, np.dot(r_spec, _context_fp(query, q_pk))
+        for delta in range(-3, 4):
+            if delta == 0:
+                continue
+            cand = int(np.clip(q_pk + delta, 0, N_BINS - 1))
+            s = np.dot(r_spec, _context_fp(query, cand))
+            if s > best_s:
+                best_s = s
+                best_bin = cand
+        refined_q.append(best_bin)
+    refined_q = np.array(refined_q)
+    order = np.argsort(ci)
+    ri, ci, refined_q = ri[order], ci[order], refined_q[order]
+    ra = TIME_AX[ref_pks[ci]]
+    qa = TIME_AX[refined_q]
     mono = [0]
     for i in range(1, len(qa)):
         if qa[i] > qa[mono[-1]]:
             mono.append(i)
     ra, qa = ra[mono], qa[mono]
-
     rf = np.concatenate([[0], ra, [RUN_MIN]])
     qf = np.concatenate([[0], qa, [RUN_MIN]])
-    warp = interp1d(rf, qf, kind='linear',
-                    bounds_error=False, fill_value='extrapolate')
+    warp = PchipInterpolator(rf, qf)
     return _warp_chroma(query, warp)
 
 
@@ -374,7 +387,7 @@ def main() -> None:
     drift_enc_fn = None
     drift_ckpt   = CKPT_DIR / 'drift_simclr.pt'
     if drift_ckpt.exists():
-        m = SpectrumEncoder().to('cpu'); m.eval()
+        m = DilatedSpectrumEncoder().to('cpu'); m.eval()
         m.load_state_dict(torch.load(drift_ckpt, map_location='cpu'))
         def drift_enc_fn(x: np.ndarray) -> np.ndarray:
             with torch.no_grad():
