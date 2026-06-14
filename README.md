@@ -1,5 +1,7 @@
 # cow-dcnn
 
+![](meme.png)
+
 Can a learned EI-MS encoder improve cross-study GC-MS chromatogram alignment between
 datasets from completely different biological matrices?
 
