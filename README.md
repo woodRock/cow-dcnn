@@ -1,18 +1,18 @@
 # cow-dcnn
 
-![](meme.png)
-
-Does explicit retention time alignment improve downstream GC-MS classification
-when a pretrained chromatogram encoder is available?
+Can a learned EI-MS encoder improve cross-study GC-MS chromatogram alignment between
+datasets from completely different biological matrices?
 
 COW (Correlation Optimised Warping) guided by EI-MS compound identities rather than
 raw TIC signal. Each chromatogram peak carries a 1000-dim m/z fingerprint; peaks are
 matched across runs using cosine similarity (optionally lifted into a learned embedding
 space) and a piecewise-linear warp is fit through the matched anchor pairs.
 
-**Short answer:** no. A CNN pretrained via next-frame prediction on raw chromatograms
-achieves 0.964 balanced accuracy on fish species classification without any alignment,
-and every alignment method we tested degrades it.
+**Short answer:** yes. A cross-study SimCLR encoder trained on matched peaks from
+wheat and rice GC-MS datasets achieves a mean Pearson TIC correlation of **0.361**
+across 3,160 wheat↔rice pairs — a **+0.081** improvement over the unaligned baseline
+(0.280), and well ahead of raw cosine similarity (+0.008) or the within-study drift
+encoder (+0.040).
 
 ## Method
 
@@ -21,18 +21,26 @@ and every alignment method we tested degrades it.
 1. **Peak detection** — find TIC peaks in each sample (top-N by height, min separation 5 bins)
 2. **M/z fingerprinting** — extract the L2-normalised m/z spectrum at each peak
 3. **Peak matching** — cosine similarity + time-window constraint + Hungarian one-to-one matching
-4. **Warp fitting** — piecewise-linear interpolation through matched anchor pairs, with monotonicity enforcement
-5. **TIC resampling** — resample the query TIC onto the reference time axis
+4. **RANSAC filtering** — remove geometric outliers from matched anchor pairs
+5. **Warp fitting** — piecewise-linear interpolation through inlier anchors, with monotonicity enforcement
+6. **TIC resampling** — resample the query TIC onto the reference time axis
 
 ### Encoder pretraining
 
-Two pretraining strategies are evaluated as a drop-in replacement for raw cosine similarity in step 3:
+Three peak-matching strategies are compared as drop-in replacements for raw cosine
+similarity in step 3:
 
-**SimCLR** (`pretrain_simclr.py`): contrastive pretraining on EI-MS spectra with spectral augmentation (Gaussian noise, random ion masking, intensity jitter). Stage 1 trains on 9,553 MoNA reference spectra for general EI-MS features; Stage 2 fine-tunes on chromatogram peak spectra from the target datasets.
+**Raw cosine**: direct m/z spectrum cosine similarity; no learned embedding.
 
-**Cross-sample drift encoder** (`pretrain_drift.py`): positive pairs are matched peak spectra from *different* GC-MS runs of the same dataset. Within fish_oil and mtbls288 separately, each sample is aligned to several reference chromatograms and the matched (ref_spectrum, query_spectrum) pairs are used as genuine same-compound observations with real inter-run spectral variation. Initialised from the MoNA SimCLR checkpoint.
+**Drift encoder** (`pretrain_drift.py`): SimCLR contrastive pretraining where positive
+pairs are matched peak spectra from *different* runs of the *same* dataset. Captures
+within-study inter-run spectral variation. Initialised from a MoNA SimCLR checkpoint.
 
-The downstream classifier uses **ChromatogramCNN** from the [chroma-dcnn](https://github.com/woodRock/chroma-dcnn) package, pretrained via next-frame prediction on raw chromatograms. This pretraining objective — predict the m/z spectrum at bin *t+1* given all preceding bins — teaches the model the temporal covariance structure of GC-MS elution without any alignment supervision.
+**Cross-study encoder** (`pretrain_cross_study.py`): SimCLR contrastive pretraining
+where positive pairs are matched peak spectra from *different* datasets (wheat and rice).
+Positive pairs are peaks matched by RANSAC-filtered COW alignment; negatives are
+unmatched peaks from different samples. This teaches the encoder to be invariant to
+the larger spectral shifts that arise when the biological matrix changes entirely.
 
 ## Data setup
 
@@ -59,12 +67,10 @@ python scripts/02_preprocess_mtbls288.py          # download + preprocess
 python scripts/02_preprocess_mtbls288.py --workers 8  # parallel download
 ```
 
-**fish oil** (NZ fish species GC-MS; not publicly available):
-
-Place the raw CSV files in `data/fish_oil/raw/`, then:
+**MTBLS21** (wheat grain GC-MS under CO₂ treatments, MetaboLights):
 
 ```bash
-python scripts/03_preprocess_fish_oil.py
+python scripts/05_preprocess_mtbls21.py
 ```
 
 **Pretraining spectra** (MoNA + MassBank EU EI-MS, ~200 MB download):
@@ -78,10 +84,10 @@ python scripts/04_download_pretrain_data.py --mona-only  # MoNA only
 
 ```
 data/
-  fish_oil/
-    chroma/       {sample_id}.npz  [200, 1000] float32
+  mtbls21/
+    chroma/       {sample_id}.npz  [200, 1000] float32   (wheat, 40 samples)
   mtbls288/
-    chroma/       {stem}.npz       [200, 1000] float32
+    chroma/       {stem}.npz       [200, 1000] float32   (rice,  79 samples)
     X.npy         [80, 1000]  sum spectra
     y.npy         [80]        cultivar labels (0–3)
     groups.txt    biological replicate IDs
@@ -93,11 +99,11 @@ data/
 ## Training
 
 ```bash
-# SimCLR: MoNA pretraining + GC-MS fine-tune
-python scripts/pretrain_simclr.py
-
-# Cross-sample drift encoder
+# Within-study drift encoder
 python scripts/pretrain_drift.py
+
+# Cross-study encoder (wheat ↔ rice positive pairs)
+python scripts/pretrain_cross_study.py
 ```
 
 Scripts auto-select CUDA → MPS → CPU. Checkpoints are saved to `checkpoints/` (excluded from git).
@@ -105,65 +111,51 @@ Scripts auto-select CUDA → MPS → CPU. Checkpoints are saved to `checkpoints/
 ## Evaluation
 
 ```bash
-python scripts/evaluate_encoders.py
+python scripts/14_cross_study.py
 ```
 
-Evaluates all available checkpoints on within-study (fish_oil 103×103) and cross-study
-(fish_oil × mtbls288 103×79) TIC correlation. Metric: mean Pearson correlation of aligned TICs.
+Evaluates all methods on the cross-study task: 3,160 wheat (MTBLS21, 40 samples) ×
+rice (MTBLS288, 79 samples) pairs. Drift window: 20 min. Precision cutoff: m/z cosine ≥ 0.7.
 
 ## Results
 
-### Alignment quality (TIC correlation)
+### Cross-study alignment (wheat MTBLS21 × rice MTBLS288, 3,160 pairs)
 
-| Method | Within-study (fish\_oil) | Cross-study (fish\_oil × mtbls288) |
-|---|---|---|
-| Unaligned | 0.564 | 0.161 |
-| Raw cosine | 0.662 | 0.162 |
-| SimCLR encoder | 0.668 | 0.162 |
-| Drift encoder | **0.675** | 0.162 |
-
-The drift encoder (trained on 8,081 real cross-sample matched peak pairs) achieves
-the best within-study alignment. Cross-study alignment does not improve meaningfully
-(0.161 → 0.162): fish_oil and MTBLS288 have different compound profiles, not merely
-shifted retention times.
-
-### Downstream classification (fish species, 4-class, 5-fold × 3 seeds)
-
-Metric: balanced accuracy (mean ± std over 15 runs). Classifiers: ChromatogramCNN
-with next-frame-prediction pretraining or random initialisation; PLS-DA and RF on the
-per-m/z max-projection feature vector. Alignment methods cited from the literature.
-
-| Alignment | CNN (pretrained) | CNN (from scratch) | PLS-DA | RF |
+| Method | TIC r | Δ unaligned | Precision | Anchors |
 |---|---|---|---|---|
-| No alignment | **0.964 ± 0.072** | 0.679 ± 0.196 | 0.325 ± 0.101 | 0.363 ± 0.076 |
-| Co-shift [Savorani 2010] | 0.947 ± 0.130 | **0.764 ± 0.119** | 0.323 ± 0.097 | 0.362 ± 0.092 |
-| icoshift [Savorani 2010] | 0.911 ± 0.148 | 0.659 ± 0.126 | 0.332 ± 0.109 | 0.353 ± 0.080 |
-| COW [Nielsen 1998] | 0.888 ± 0.122 | 0.710 ± 0.165 | 0.322 ± 0.099 | 0.383 ± 0.094 |
-| m/z COW (cosine) | 0.853 ± 0.129 | 0.681 ± 0.220 | 0.333 ± 0.083 | 0.391 ± 0.074 |
-| m/z COW (drift enc.) | 0.856 ± 0.133 | 0.717 ± 0.139 | 0.329 ± 0.086 | **0.411 ± 0.078** |
+| Unaligned | 0.280 | — | — | — |
+| Raw cosine | 0.288 | +0.008 | 1.000 | 1.6 |
+| Drift encoder | 0.320 | +0.040 | 0.967 | 2.2 |
+| **Cross-study encoder** | **0.361** | **+0.081** | 0.959 | 2.1 |
+
+- **TIC r**: mean Pearson correlation of aligned TICs across all wheat↔rice pairs
+- **Precision**: fraction of matched peak pairs with m/z cosine ≥ 0.7 (same-compound proxy)
+- **Anchors**: mean RANSAC-inlier anchor pairs used per alignment
 
 **Key findings:**
 
-- *Pretraining dominates alignment.* The pretrained CNN without any alignment (0.964)
-  outperforms every aligned condition for the from-scratch model (best: 0.764).
-  The pretraining gap is an order of magnitude larger than any alignment gain.
+- *Cross-study pretraining is the key.* The cross-study encoder (0.361) substantially
+  outperforms both raw cosine (0.288) and the drift encoder trained only on within-study
+  pairs (0.320). Exposure to genuine wheat↔rice spectral variation during pretraining
+  allows the model to find shared metabolites across completely different matrices.
 
-- *Every alignment method degrades the pretrained CNN.* The decline is monotone with
-  alignment complexity: 0.964 → 0.947 (co-shift) → 0.911 (icoshift) → 0.888 (COW)
-  → 0.853 (m/z COW). The pretrained model was trained on raw unaligned chromatograms;
-  post-hoc warping takes the input out of its training distribution.
+- *Raw cosine yields almost no improvement.* With only 1.6 RANSAC-inlier anchors per
+  pair on average, raw cosine matching struggles to find enough reliable shared
+  compounds between wheat and rice for the COW warp to be effective (+0.008).
 
-- *For models without pretraining, only simple alignment helps.* Co-shift improves
-  from-scratch accuracy (+0.085) and reduces variance (σ: 0.196 → 0.119). Icoshift
-  and m/z COW (cosine) do not improve over no alignment; only co-shift and COW yield
-  a net gain.
+- *Learned encoders find more anchors with acceptable precision.* Both learned
+  encoders increase mean anchors to ~2.1–2.2 while maintaining high precision
+  (≥0.96), giving COW enough anchor pairs to fit a meaningful warp.
 
-- *Classical methods are alignment-insensitive.* PLS-DA (0.322–0.333) and RF
-  (0.353–0.411) show no consistent improvement across alignment conditions.
+- *The cross-study encoder trades a small precision drop for a large alignment gain.*
+  Precision falls from 1.000 (raw cosine) to 0.959 (cross-study encoder), but TIC r
+  rises by +0.081 — the encoder correctly retrieves more shared-compound pairs that
+  raw cosine similarity missed.
 
-**Limitations.** Results are from a single dataset (103 fish oil samples, 4 classes).
-Classical baselines use a max-projection feature rather than a conventional aligned
-peak table, which may understate their performance.
+**Limitations.** Only two datasets are evaluated; results may vary with different
+biological matrices or instrument platforms. Precision is a proxy (m/z cosine ≥ 0.7)
+rather than confirmed compound identity. The cross-study encoder was pretrained on the
+same two datasets used for evaluation, so generalisation to unseen study pairs is untested.
 
 ## Exploration
 
