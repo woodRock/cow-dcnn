@@ -1,31 +1,32 @@
 """
-Cross-study contrastive pretraining for DilatedSpectrumEncoder.
+06_pretrain_cross_study.py — Cross-study SimCLR pretraining with PeakSequenceTransformer.
 
-Extends pretrain_drift.py with cross-study simulation:
-  - Partial compound overlap: N_SHARED metabolites appear in both "studies";
-    N_UNIQUE compounds are unique to each study (co-elution background only).
-  - Larger RT drift (±MAX_DRIFT_BINS = 25 bins ≈ ±5.6 min).
-  - Study-level batch effects: random global intensity scale per study.
-  - Per-compound spectral distortion between studies (lognormal σ=0.15)
-    to simulate instrument-specific EI fragment-response differences.
+Trains PeakSequenceTransformer on synthetic cross-study chromatogram pairs.
 
-Positive pairs come ONLY from shared metabolite peaks.  Study-unique peaks
-contribute realistic co-elution background but do not enter the NT-Xent loss.
+Architecture:
+  Per-peak: dilated-CNN over the m/z axis → d_model-dim token
+  Global:   sinusoidal RT positional encoding + Transformer self-attention over
+            all N detected peaks in a chromatogram
 
-Why partial overlap?
---------------------
-Cross-study alignment fails not just because of RT drift but because each
-study contains a different subset of detectable metabolites.  A within-study
-pretrained encoder sees ALL compounds in both views and learns pure drift
-invariance.  Here, only N_SHARED of N_SHARED+N_UNIQUE compounds appear in
-both simulated studies, forcing the encoder to identify compound identity
-from spectral shape alone — the key skill needed for cross-study anchoring.
+Why a Transformer over peak sequences?
+  Compound elution order is conserved across studies even when absolute RTs drift
+  (compound A always elutes before compound B).  A local-window encoder (e.g.
+  ChromaSpectrumEncoder) sees at most ±7 bins (3.4 min) of RT context and cannot
+  capture this global monotonic constraint.  The Transformer sees the full sequence
+  of N peaks at once, so each peak's embedding encodes both its m/z identity and
+  its position in the elution order — a signal that is consistent across studies.
 
-Saves: checkpoints/cross_study_simclr.pt
+Training:
+  Each iteration generates N_PAIRS_PER_ITER synthetic "study pairs".  Each pair has
+  N_SHARED shared compounds (same order, different absolute RT) and N_UNIQUE study-
+  specific background compounds.  All N_TOTAL = 30 peaks are encoded together through
+  the Transformer.  Only the N_SHARED shared-peak embeddings enter the NT-Xent loss.
+
+Output: checkpoints/cross_study_simclr.pt
 """
-
 from __future__ import annotations
 
+import math
 import sys
 import h5py
 import numpy as np
@@ -34,7 +35,7 @@ import torch.optim as optim
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-from encoder import DilatedSpectrumEncoder, nt_xent_loss
+from encoder import PeakSequenceTransformer, nt_xent_loss
 
 DATA_DIR = Path(__file__).parent.parent / 'data'
 CKPT_DIR = Path(__file__).parent.parent / 'checkpoints'
@@ -47,15 +48,21 @@ BIN_MIN = RUN_MIN / N_BINS
 
 N_ITERATIONS = 10_000
 LOG_EVERY    = 200
+BATCH_SIZE   = 64
 PEAK_SIGMA   = 2.5    # bins — ~0.5 min GC-MS peak width
 NOISE_SCALE  = 0.005  # exponential baseline noise
 
 # Cross-study-specific parameters
 N_SHARED            = 15            # shared metabolites → positive pairs
-N_UNIQUE            = 15            # study-specific compounds → background only
-MAX_DRIFT_BINS      = 25            # ±25 bins = ±5.625 min  (vs ±18 within-study)
+N_UNIQUE            = 15            # study-specific background compounds
+N_TOTAL             = N_SHARED + N_UNIQUE   # fixed sequence length (30 peaks)
+MAX_DRIFT_BINS      = 25            # ±25 bins = ±5.625 min
 STUDY_SCALE_RANGE   = (0.5, 2.0)   # per-study global intensity batch effect
 SPECTRAL_DISTORTION = 0.15         # lognormal σ for per-fragment variation
+
+# Each batch encodes N_PAIRS_PER_ITER full chromatogram pairs.
+# N_SHARED embeddings per pair → total > BATCH_SIZE, trimmed to BATCH_SIZE.
+N_PAIRS_PER_ITER = math.ceil(BATCH_SIZE / N_SHARED)   # = 5
 
 _OFFSETS = np.arange(-8, 9, dtype=np.int32)
 _GAUSS_W = np.exp(-0.5 * (_OFFSETS / PEAK_SIGMA) ** 2).astype(np.float32)
@@ -75,8 +82,9 @@ def load_mona(path: Path = MONA_H5, split: str = 'train') -> np.ndarray:
 # ── Synthetic chromatogram building ──────────────────────────────────────────
 
 def _ctx_spec(chroma: np.ndarray, pk: int) -> np.ndarray:
+    """3-bin mean fingerprint at peak pk, L2-normalised. Shape: (1000,)."""
     lo = max(0, pk - 1)
-    hi = min(len(chroma), pk + 2)
+    hi = min(chroma.shape[0], pk + 2)
     v  = chroma[lo:hi].mean(axis=0)
     n  = np.linalg.norm(v)
     return (v / n).astype(np.float32) if n > 1e-8 else v.astype(np.float32)
@@ -114,123 +122,164 @@ def _build_chromatogram(compounds: np.ndarray, positions: np.ndarray,
 
 def _distort_spectrum(spec: np.ndarray, sigma: float,
                        rng: np.random.Generator) -> np.ndarray:
-    """Per-fragment lognormal distortion — simulates instrument EI response variation."""
     d = spec * rng.lognormal(0.0, sigma, size=spec.shape).astype(np.float32)
     n = np.linalg.norm(d)
     return (d / n).astype(np.float32) if n > 1e-8 else d.astype(np.float32)
 
 
-# ── On-the-fly batch generation ───────────────────────────────────────────────
+# ── Augmentation ──────────────────────────────────────────────────────────────
 
 def augment(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """SimCLR augmentations for a single (1000,) L2-normed m/z fingerprint."""
     x = x.copy()
     if rng.random() > 0.2:
         x = np.clip(x + rng.normal(0, 0.02, size=x.shape).astype(np.float32), 0, None)
     if rng.random() > 0.3:
-        x[rng.random(size=x.shape) < 0.08] = 0.0   # 8% masking (heavier than within-study)
+        x[rng.random(size=x.shape) < 0.08] = 0.0
     if rng.random() > 0.3:
-        x = x * rng.uniform(0.80, 1.20, size=x.shape).astype(np.float32)
+        x *= float(rng.uniform(0.80, 1.20))
     n = np.linalg.norm(x)
     return (x / n).astype(np.float32) if n > 1e-8 else x.astype(np.float32)
 
 
-def _make_batch(mona_specs: np.ndarray, batch_size: int,
-                rng: np.random.Generator) -> tuple[torch.Tensor, ...]:
-    """
-    Generate a batch of cross-study positive pairs on-the-fly.
+# ── Batch generation ──────────────────────────────────────────────────────────
 
-    Each synthetic iteration produces two "studies" with N_SHARED shared
-    metabolites and N_UNIQUE unique background compounds each.  Only shared
-    metabolite peaks enter the NT-Xent loss as positive pairs.
+def _generate_pair(mona_specs: np.ndarray,
+                    rng: np.random.Generator) -> tuple[np.ndarray, ...]:
     """
-    batch_a: list[np.ndarray] = []
-    batch_b: list[np.ndarray] = []
-    rts_a:   list[float] = []
-    rts_b:   list[float] = []
+    Generate one pair of synthetic chromatograms sharing N_SHARED compounds.
 
-    n_pool = N_SHARED + 2 * N_UNIQUE
+    Both chromatograms have exactly N_TOTAL peaks sorted by ascending RT.
+    The N_SHARED shared peaks appear in the same relative elution order in both
+    studies but with RT drift of up to ±MAX_DRIFT_BINS bins.
+
+    Returns:
+        fps_a  : (N_TOTAL, 1000)  augmented per-peak fingerprints for study A
+        rts_a  : (N_TOTAL,)      normalised RT positions for study A [0, 1]
+        fps_b  : (N_TOTAL, 1000)  augmented per-peak fingerprints for study B
+        rts_b  : (N_TOTAL,)      normalised RT positions for study B [0, 1]
+        mask_a : (N_TOTAL,) bool  True at positions of shared peaks in study A
+        mask_b : (N_TOTAL,) bool  True at positions of shared peaks in study B
+    """
+    n_pool  = N_SHARED + 2 * N_UNIQUE
     replace = n_pool > len(mona_specs)
 
-    while len(batch_a) < batch_size:
-        pool_idx = rng.choice(len(mona_specs), size=n_pool, replace=replace)
-
+    while True:
+        pool_idx     = rng.choice(len(mona_specs), size=n_pool, replace=replace)
         shared_idx   = pool_idx[:N_SHARED]
-        unique_a_idx = pool_idx[N_SHARED : N_SHARED + N_UNIQUE]
+        unique_a_idx = pool_idx[N_SHARED:N_SHARED + N_UNIQUE]
         unique_b_idx = pool_idx[N_SHARED + N_UNIQUE:]
 
-        # Study A: shared compounds (undistorted) + study-A-unique background
         shared_a = mona_specs[shared_idx]
         unique_a = mona_specs[unique_a_idx]
-
-        # Study B: same compounds but instrument-distorted + study-B-unique background
         shared_b = np.array([_distort_spectrum(mona_specs[i], SPECTRAL_DISTORTION, rng)
                               for i in shared_idx])
         unique_b = mona_specs[unique_b_idx]
 
-        # RT positions for shared compounds in study A
         pks_shared_a = _random_positions(N_SHARED, N_BINS, min_gap=6, rng=rng)
         n_s = len(pks_shared_a)
-        if n_s < 2:
+        if n_s < N_SHARED:
             continue
 
-        # Study B: same compounds shifted by cross-study drift
         drift        = rng.integers(-MAX_DRIFT_BINS, MAX_DRIFT_BINS + 1, size=n_s)
         pks_shared_b = np.clip(pks_shared_a + drift, 2, N_BINS - 3)
 
-        # Background compounds placed independently in each study
         pks_uniq_a = _random_positions(N_UNIQUE, N_BINS, min_gap=6, rng=rng)
         pks_uniq_b = _random_positions(N_UNIQUE, N_BINS, min_gap=6, rng=rng)
-        n_ua, n_ub = len(pks_uniq_a), len(pks_uniq_b)
+        n_ua = len(pks_uniq_a)
+        n_ub = len(pks_uniq_b)
 
-        # Assemble compound arrays and positions for each study
         compounds_a = np.concatenate([shared_a[:n_s], unique_a[:n_ua]])
         compounds_b = np.concatenate([shared_b[:n_s], unique_b[:n_ub]])
-        pks_a       = np.concatenate([pks_shared_a,   pks_uniq_a])
-        pks_b       = np.concatenate([pks_shared_b,   pks_uniq_b])
+        pks_a_all   = np.concatenate([pks_shared_a, pks_uniq_a])
+        pks_b_all   = np.concatenate([pks_shared_b, pks_uniq_b])
 
-        # Study-level batch effects: independent global intensity scales
         scale_a = float(rng.uniform(*STUDY_SCALE_RANGE))
         scale_b = float(rng.uniform(*STUDY_SCALE_RANGE))
-        h_a = (rng.uniform(0.3, 2.5, size=len(pks_a)) * scale_a).astype(np.float32)
-        h_b = (rng.uniform(0.3, 2.5, size=len(pks_b)) * scale_b).astype(np.float32)
+        h_a = (rng.uniform(0.3, 2.5, size=len(pks_a_all)) * scale_a).astype(np.float32)
+        h_b = (rng.uniform(0.3, 2.5, size=len(pks_b_all)) * scale_b).astype(np.float32)
 
-        chroma_a = _build_chromatogram(compounds_a, pks_a, h_a, rng)
-        chroma_b = _build_chromatogram(compounds_b, pks_b, h_b, rng)
+        chroma_a = _build_chromatogram(compounds_a, pks_a_all, h_a, rng)
+        chroma_b = _build_chromatogram(compounds_b, pks_b_all, h_b, rng)
 
-        # Only shared peaks → positive pairs in NT-Xent
-        for pk_a_i, pk_b_i in zip(pks_shared_a[:n_s], pks_shared_b):
-            if len(batch_a) >= batch_size:
-                break
-            batch_a.append(augment(_ctx_spec(chroma_a, pk_a_i), rng))
-            batch_b.append(augment(_ctx_spec(chroma_b, pk_b_i), rng))
-            rts_a.append(float(pk_a_i) / N_BINS)
-            rts_b.append(float(pk_b_i) / N_BINS)
+        # is_shared: first n_s entries (shared) are True, remaining (unique) are False
+        is_shared_a = np.array([True] * n_s + [False] * n_ua, dtype=bool)
+        is_shared_b = np.array([True] * n_s + [False] * n_ub, dtype=bool)
 
-    x1 = torch.from_numpy(np.stack(batch_a[:batch_size]))
-    x2 = torch.from_numpy(np.stack(batch_b[:batch_size]))
-    r1 = torch.tensor(rts_a[:batch_size], dtype=torch.float32)
-    r2 = torch.tensor(rts_b[:batch_size], dtype=torch.float32)
-    return x1, x2, r1, r2
+        # Sort by RT — Transformer input must be in ascending RT order
+        sort_a = np.argsort(pks_a_all)
+        sort_b = np.argsort(pks_b_all)
+        pks_a_sorted  = pks_a_all[sort_a]
+        pks_b_sorted  = pks_b_all[sort_b]
+        mask_a_sorted = is_shared_a[sort_a]
+        mask_b_sorted = is_shared_b[sort_b]
+
+        # Extract fingerprints with per-peak augmentation
+        fps_a_list = [augment(_ctx_spec(chroma_a, int(pk)), rng) for pk in pks_a_sorted]
+        fps_b_list = [augment(_ctx_spec(chroma_b, int(pk)), rng) for pk in pks_b_sorted]
+
+        # Pack into fixed-length N_TOTAL arrays (pad with zeros if somehow short)
+        fps_a  = np.zeros((N_TOTAL, 1000), dtype=np.float32)
+        fps_b  = np.zeros((N_TOTAL, 1000), dtype=np.float32)
+        rts_a  = np.zeros(N_TOTAL, dtype=np.float32)
+        rts_b  = np.zeros(N_TOTAL, dtype=np.float32)
+        mask_a = np.zeros(N_TOTAL, dtype=bool)
+        mask_b = np.zeros(N_TOTAL, dtype=bool)
+
+        na = min(len(fps_a_list), N_TOTAL)
+        nb = min(len(fps_b_list), N_TOTAL)
+        fps_a[:na]  = np.array(fps_a_list[:na])
+        fps_b[:nb]  = np.array(fps_b_list[:nb])
+        rts_a[:na]  = pks_a_sorted[:na].astype(np.float32) / N_BINS
+        rts_b[:nb]  = pks_b_sorted[:nb].astype(np.float32) / N_BINS
+        mask_a[:na] = mask_a_sorted[:na]
+        mask_b[:nb] = mask_b_sorted[:nb]
+
+        return fps_a, rts_a, fps_b, rts_b, mask_a, mask_b
+
+
+def _make_batch(mona_specs: np.ndarray, n_pairs: int,
+                rng: np.random.Generator) -> tuple[np.ndarray, ...]:
+    """
+    Stack n_pairs chromatogram pairs along a batch dimension.
+
+    Returns:
+        fps_a   : (P, N_TOTAL, 1000)
+        rts_a   : (P, N_TOTAL)
+        fps_b   : (P, N_TOTAL, 1000)
+        rts_b   : (P, N_TOTAL)
+        masks_a : (P, N_TOTAL) bool
+        masks_b : (P, N_TOTAL) bool
+    """
+    pairs = [_generate_pair(mona_specs, rng) for _ in range(n_pairs)]
+    return (
+        np.stack([p[0] for p in pairs]),
+        np.stack([p[1] for p in pairs]),
+        np.stack([p[2] for p in pairs]),
+        np.stack([p[3] for p in pairs]),
+        np.stack([p[4] for p in pairs]),
+        np.stack([p[5] for p in pairs]),
+    )
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(device, n_iterations: int = N_ITERATIONS, batch_size: int = 64,
+def train(device, n_iterations: int = N_ITERATIONS, batch_size: int = BATCH_SIZE,
           lr: float = 1e-4, seed: int = 42) -> None:
 
     print("Loading MoNA train-split spectra …")
     mona = load_mona(MONA_H5, split='train')
-    print(f"  {len(mona)} spectra  (1000-dim, L2-normed, no downstream data)")
+    print(f"  {len(mona)} spectra  (1000-dim, L2-normed)")
 
-    model = DilatedSpectrumEncoder().to(device)
+    model = PeakSequenceTransformer().to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Architecture : DilatedSpectrumEncoder  ({n_params:,} params)")
-    print(f"  N_SHARED={N_SHARED}  N_UNIQUE={N_UNIQUE}  "
-          f"MAX_DRIFT=±{MAX_DRIFT_BINS} bins (±{MAX_DRIFT_BINS*BIN_MIN:.2f} min)")
-    print(f"  Study scale  : {STUDY_SCALE_RANGE}   "
-          f"Spectral distortion σ={SPECTRAL_DISTORTION}")
-    print(f"  Iterations   : {n_iterations}  |  batch: {batch_size}  "
-          f"|  log every: {LOG_EVERY}\n")
+    print(f"  Architecture : PeakSequenceTransformer  ({n_params:,} params)")
+    print(f"  Sequence len : {N_TOTAL} peaks  ({N_SHARED} shared + {N_UNIQUE} unique per study)")
+    print(f"  Pairs/iter   : {N_PAIRS_PER_ITER}  →  {N_PAIRS_PER_ITER * N_SHARED} embeddings "
+          f"trimmed to batch_size={batch_size}")
+    print(f"  MAX_DRIFT=±{MAX_DRIFT_BINS} bins (±{MAX_DRIFT_BINS * BIN_MIN:.2f} min)")
+    print(f"  Study scale: {STUDY_SCALE_RANGE}   Spectral distortion σ={SPECTRAL_DISTORTION}")
+    print(f"  Iterations: {n_iterations}  |  lr: {lr}  |  log every: {LOG_EVERY}\n")
 
     opt   = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_iterations)
@@ -240,11 +289,29 @@ def train(device, n_iterations: int = N_ITERATIONS, batch_size: int = 64,
     running_loss = 0.0
 
     for it in range(1, n_iterations + 1):
-        x1, x2, r1, r2 = _make_batch(mona, batch_size, rng)
-        x1, x2 = x1.to(device), x2.to(device)
-        r1, r2 = r1.to(device), r2.to(device)
+        fps_a, rts_a, fps_b, rts_b, masks_a, masks_b = _make_batch(mona, N_PAIRS_PER_ITER, rng)
 
-        loss = nt_xent_loss(model(x1, r1), model(x2, r2))
+        fps_a_t = torch.from_numpy(fps_a).to(device)   # (P, N_TOTAL, 1000)
+        rts_a_t = torch.from_numpy(rts_a).to(device)   # (P, N_TOTAL)
+        fps_b_t = torch.from_numpy(fps_b).to(device)
+        rts_b_t = torch.from_numpy(rts_b).to(device)
+
+        # Encode full peak sequences — Transformer attends across all N_TOTAL peaks
+        emb_a = model.encode(fps_a_t, rts_a_t)   # (P, N_TOTAL, 128)
+        emb_b = model.encode(fps_b_t, rts_b_t)
+
+        # Collect shared-peak embeddings from all chromatogram pairs
+        z1_parts, z2_parts = [], []
+        for i in range(N_PAIRS_PER_ITER):
+            si_a = torch.from_numpy(masks_a[i]).to(device)
+            si_b = torch.from_numpy(masks_b[i]).to(device)
+            z1_parts.append(emb_a[i][si_a])
+            z2_parts.append(emb_b[i][si_b])
+
+        z1 = torch.cat(z1_parts, dim=0)[:batch_size]   # (B, 128)
+        z2 = torch.cat(z2_parts, dim=0)[:batch_size]
+
+        loss = nt_xent_loss(model.project(z1), model.project(z2))
         opt.zero_grad(); loss.backward(); opt.step()
         sched.step()
 

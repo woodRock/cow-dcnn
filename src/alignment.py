@@ -12,7 +12,7 @@ from sklearn.linear_model import RANSACRegressor
 from sklearn.metrics.pairwise import cosine_similarity
 
 sys.path.insert(0, str(Path(__file__).parent))
-from encoder import DilatedSpectrumEncoder
+from encoder import DilatedSpectrumEncoder, ChromaSpectrumEncoder, PeakSequenceTransformer, WINDOW_HALF
 
 N_BINS    = 200
 RUN_MIN   = 45.0
@@ -50,6 +50,21 @@ def fingerprints(chroma: np.ndarray, pks: np.ndarray) -> np.ndarray:
     return np.array([_ctx_fp(chroma, pk) for pk in pks])
 
 
+def peak_windows(chroma: np.ndarray, pks: np.ndarray,
+                 half_width: int = WINDOW_HALF) -> np.ndarray:
+    """Extract L2-normalised RT windows around each peak.
+    Returns (N_peaks, 2*half_width+1, 1000)."""
+    W   = 2 * half_width + 1
+    out = np.zeros((len(pks), W, chroma.shape[1]), dtype=np.float32)
+    for i, pk in enumerate(pks):
+        for j, t in enumerate(range(int(pk) - half_width, int(pk) + half_width + 1)):
+            if 0 <= t < chroma.shape[0]:
+                v = chroma[t]
+                n = np.linalg.norm(v)
+                out[i, j] = (v / n).astype(np.float32) if n > 1e-8 else v.astype(np.float32)
+    return out
+
+
 def align_pair(query: np.ndarray, ref: np.ndarray,
                encode_fn=None,
                return_anchors: bool = False):
@@ -77,8 +92,12 @@ def align_pair(query: np.ndarray, ref: np.ndarray,
     q_rts   = q_pks.astype(np.float32) / N_BINS
 
     if encode_fn is not None:
-        ref_rep = encode_fn(ref_fps, ref_rts)
-        q_rep   = encode_fn(q_fps,   q_rts)
+        if getattr(encode_fn, 'uses_windows', False):
+            ref_rep = encode_fn(peak_windows(ref,   ref_pks))
+            q_rep   = encode_fn(peak_windows(query, q_pks))
+        else:
+            ref_rep = encode_fn(ref_fps, ref_rts)
+            q_rep   = encode_fn(q_fps,   q_rts)
     else:
         ref_rep, q_rep = ref_fps, q_fps
 
@@ -194,7 +213,21 @@ def embed_chromatogram(chroma: np.ndarray, encode_fn) -> np.ndarray:
 
 
 def load_encoder(path: Path, device: torch.device = None):
-    """Load a DilatedSpectrumEncoder checkpoint and return an encode_fn."""
+    """Load an encoder checkpoint and return an encode_fn.
+
+    Auto-detects model type from state-dict keys:
+      - PeakSequenceTransformer : has 'transformer.' keys  (full-sequence encoder)
+      - ChromaSpectrumEncoder   : has 'mz_stem.' + 'rt_blocks.' keys  (local window)
+      - DilatedSpectrumEncoder  : default (1-D per-peak CNN)
+
+    The returned encode_fn signature is always (fps, rts) → embeddings:
+      fps : (N, 1000) L2-normed m/z fingerprints for N detected peaks
+      rts : (N,) normalised RT positions in [0, 1]
+      → (N, emb_dim)
+
+    ChromaSpectrumEncoder also has uses_windows=True; align_pair passes
+    (N, W, 1000) RT windows instead of (N, 1000) fingerprints.
+    """
     if device is None:
         if torch.cuda.is_available():
             device = torch.device('cuda')
@@ -202,15 +235,49 @@ def load_encoder(path: Path, device: torch.device = None):
             device = torch.device('mps')
         else:
             device = torch.device('cpu')
-    m = DilatedSpectrumEncoder().to(device)
-    m.load_state_dict(torch.load(path, map_location=device))
-    m.eval()
 
-    def encode_fn(x: np.ndarray, rt: np.ndarray = None) -> np.ndarray:
-        with torch.no_grad():
-            t = torch.from_numpy(x.astype('float32')).to(device)
-            r = torch.from_numpy(rt.astype('float32')).to(device) if rt is not None else None
-            return m.encode(t, r).cpu().numpy()
+    state = torch.load(path, map_location=device)
+    has_transformer = any(k.startswith('transformer.') for k in state.keys())
+    has_mz_stem     = any(k.startswith('mz_stem')      for k in state.keys())
+
+    if has_transformer:
+        m = PeakSequenceTransformer().to(device)
+        m.load_state_dict(state)
+        m.eval()
+
+        def encode_fn(x: np.ndarray, rt: np.ndarray = None) -> np.ndarray:
+            # x: (N, 1000), rt: (N,) — all peaks passed together for global attention
+            with torch.no_grad():
+                fps_t = torch.from_numpy(x.astype('float32')).unsqueeze(0).to(device)
+                rts_t = torch.from_numpy(rt.astype('float32')).unsqueeze(0).to(device)
+                return m.encode(fps_t, rts_t).squeeze(0).cpu().numpy()
+
+        encode_fn.uses_windows = False
+
+    elif has_mz_stem:
+        m = ChromaSpectrumEncoder().to(device)
+        m.load_state_dict(state)
+        m.eval()
+
+        def encode_fn(x: np.ndarray, rt: np.ndarray = None) -> np.ndarray:
+            with torch.no_grad():
+                t = torch.from_numpy(x.astype('float32')).to(device)
+                return m.encode(t).cpu().numpy()
+
+        encode_fn.uses_windows = True
+
+    else:
+        m = DilatedSpectrumEncoder().to(device)
+        m.load_state_dict(state)
+        m.eval()
+
+        def encode_fn(x: np.ndarray, rt: np.ndarray = None) -> np.ndarray:
+            with torch.no_grad():
+                t = torch.from_numpy(x.astype('float32')).to(device)
+                r = torch.from_numpy(rt.astype('float32')).to(device) if rt is not None else None
+                return m.encode(t, r).cpu().numpy()
+
+        encode_fn.uses_windows = False
 
     return encode_fn
 
