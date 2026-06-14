@@ -43,25 +43,18 @@ class SpectrumEncoder(nn.Module):
 
 
 class _DilatedResBlock(nn.Module):
-    """Two dilated conv layers with a residual skip and GELU activation.
-
-    norm_fn: factory callable (channels) → normalisation module.
-    Defaults to BatchNorm1d; pass `lambda c: nn.GroupNorm(8, c)` for MPS compat.
-    """
-    def __init__(self, channels: int, dilation: int, kernel_size: int = 3,
-                 norm_fn=None):
+    """Two dilated conv layers with a residual skip and GELU activation."""
+    def __init__(self, channels: int, dilation: int, kernel_size: int = 3):
         super().__init__()
-        if norm_fn is None:
-            norm_fn = nn.BatchNorm1d
         pad = (kernel_size - 1) * dilation // 2   # 'same' padding for odd kernels
         self.net = nn.Sequential(
             nn.Conv1d(channels, channels, kernel_size,
                       dilation=dilation, padding=pad, bias=False),
-            norm_fn(channels),
+            nn.BatchNorm1d(channels),
             nn.GELU(),
             nn.Conv1d(channels, channels, kernel_size,
                       dilation=dilation, padding=pad, bias=False),
-            norm_fn(channels),
+            nn.BatchNorm1d(channels),
         )
         self.act = nn.GELU()
 
