@@ -98,8 +98,11 @@ Scripts auto-select CUDA → MPS → CPU. Checkpoints are saved to `checkpoints/
 ## Evaluation
 
 ```bash
-python scripts/07_library_matching.py  # chemistry standard benchmarks
-python scripts/08_cross_study.py       # cross-study alignment evaluation
+python scripts/07_cross_study.py       # TIC correlation  (main alignment metric)
+python scripts/08_library_precision.py # MoNA library-matched compound precision
+python scripts/09_rt_consistency.py    # RT deviation for shared compounds
+python scripts/10_batch_effect.py      # k-NN batch effect in feature space
+python scripts/11_transfer.py          # cross-study transfer classification
 ```
 
 Evaluates all methods on the cross-study task: 3,160 wheat (MTBLS21, 40 samples) ×
