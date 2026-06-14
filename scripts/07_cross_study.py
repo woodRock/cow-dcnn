@@ -32,6 +32,7 @@ from pathlib import Path
 from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.optimize import linear_sum_assignment
 from scipy.signal import find_peaks as sp_find_peaks
+from scipy.stats import wilcoxon
 from sklearn.linear_model import RANSACRegressor
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -216,7 +217,7 @@ def _load_cnn_encoder(path: Path):
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 def evaluate(m21: list[np.ndarray], m288: list[np.ndarray],
-             encode_fn=None) -> dict:
+             encode_fn=None) -> tuple[dict, list]:
     """Evaluate alignment across all 40×79 wheat↔rice pairs."""
     m288_tics = [c.sum(axis=1) for c in m288]
 
@@ -239,7 +240,7 @@ def evaluate(m21: list[np.ndarray], m288: list[np.ndarray],
         'tic_r':     float(np.nanmean(cors)),
         'precision': float(np.nanmean(precs)),
         'n_anchors': float(np.nanmean(ancs)),
-    }
+    }, cors
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -257,11 +258,12 @@ def main() -> None:
     # Unaligned baseline
     m21_tics  = [c.sum(axis=1) for c in m21]
     m288_tics = [c.sum(axis=1) for c in m288]
-    unaligned_r = float(np.mean([
-        np.corrcoef(ref_tic, q_tic)[0, 1]
+    unaligned_cors = [
+        float(np.corrcoef(ref_tic, q_tic)[0, 1])
         for q_tic in m21_tics
         for ref_tic in m288_tics
-    ]))
+    ]
+    unaligned_r = float(np.nanmean(unaligned_cors))
     print(f"Unaligned baseline  TIC r = {unaligned_r:.3f}\n")
 
     # Methods: (label, encode_fn)
@@ -277,10 +279,12 @@ def main() -> None:
     print()
 
     results = {}
+    per_pair_cors = {'Unaligned': unaligned_cors}
     for label, enc_fn in methods:
         print(f"Evaluating: {label} …")
-        r = evaluate(m21, m288, encode_fn=enc_fn)
+        r, cors = evaluate(m21, m288, encode_fn=enc_fn)
         results[label] = r
+        per_pair_cors[label] = cors
         print(f"  TIC r={r['tic_r']:.3f}  precision={r['precision']:.3f}  "
               f"anchors={r['n_anchors']:.1f}\n")
 
@@ -300,6 +304,26 @@ def main() -> None:
     print("Precision: fraction of matched peak pairs with m/z cosine ≥ "
           f"{PRECISION_CUTOFF} (same-compound proxy)")
     print("Anchors  : mean RANSAC-inlier anchor pairs used per alignment")
+
+    # Wilcoxon signed-rank tests
+    print(f"\n{'=' * 75}")
+    print("Paired Wilcoxon signed-rank tests (n=3,160 pairs, two-sided)")
+    print(f"{'-' * 75}")
+    print(f"{'Comparison':<44}  {'stat':>10}  {'p-value':>12}  {'sig':>5}")
+    print(f"{'-' * 75}")
+    ordered = ['Unaligned', 'Raw cosine', 'Drift encoder', 'Cross-study encoder']
+    ordered = [m for m in ordered if m in per_pair_cors]
+    comparisons = [
+        (a, b) for i, a in enumerate(ordered) for b in ordered[i+1:]
+    ]
+    for a, b in comparisons:
+        ca = np.array(per_pair_cors[a])
+        cb = np.array(per_pair_cors[b])
+        stat, p = wilcoxon(ca, cb, alternative='two-sided')
+        sig = '***' if p < 0.001 else ('**' if p < 0.01 else ('*' if p < 0.05 else 'ns'))
+        print(f"  {b:<20} vs {a:<18}  {stat:>10.1f}  {p:>12.3e}  {sig:>5}")
+    print(f"{'=' * 75}")
+    print("Significance: *** p<0.001  ** p<0.01  * p<0.05  ns not significant")
 
 
 if __name__ == '__main__':
