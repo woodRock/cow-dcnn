@@ -34,11 +34,11 @@ similarity in step 3:
 
 **Raw cosine**: direct m/z spectrum cosine similarity; no learned embedding.
 
-**Drift encoder** (`pretrain_drift.py`): SimCLR contrastive pretraining where positive
+**Drift encoder** (`05_pretrain_drift.py`): SimCLR contrastive pretraining where positive
 pairs are matched peak spectra from *different* runs of the *same* dataset. Captures
 within-study inter-run spectral variation. Initialised from a MoNA SimCLR checkpoint.
 
-**Cross-study encoder** (`pretrain_cross_study.py`): SimCLR contrastive pretraining
+**Cross-study encoder** (`06_pretrain_cross_study.py`): SimCLR contrastive pretraining
 where positive pairs are matched peak spectra from *different* datasets (wheat and rice).
 Positive pairs are peaks matched by RANSAC-filtered COW alignment; negatives are
 unmatched peaks from different samples. This teaches the encoder to be invariant to
@@ -49,37 +49,24 @@ the larger spectral shifts that arise when the biological matrix changes entirel
 Raw data is excluded from version control (`data/**` in `.gitignore`).
 Run the scripts below in order to reproduce the datasets from scratch.
 
-### Option A — copy from an existing chroma-dcnn checkout (fastest)
-
-If you already have a local `chroma-dcnn` repo with processed data:
-
-```bash
-python scripts/01_download_data.py --from-chroma-dcnn /path/to/chroma-dcnn
-```
-
-This copies all processed `.npz` chromatogram files directly, skipping raw
-download and CDF parsing.
-
-### Option B — download + preprocess from public sources
-
 **MTBLS288** (rice grain GC-MS, MetaboLights, ~5 GB raw):
 
 ```bash
-python scripts/02_preprocess_mtbls288.py          # download + preprocess
-python scripts/02_preprocess_mtbls288.py --workers 8  # parallel download
+python scripts/01_preprocess_mtbls288.py          # download + preprocess
+python scripts/01_preprocess_mtbls288.py --workers 8  # parallel download
 ```
 
 **MTBLS21** (wheat grain GC-MS under CO₂ treatments, MetaboLights):
 
 ```bash
-python scripts/05_preprocess_mtbls21.py
+python scripts/02_preprocess_mtbls21.py
 ```
 
 **Pretraining spectra** (MoNA + MassBank EU EI-MS, ~200 MB download):
 
 ```bash
-python scripts/04_download_pretrain_data.py          # MoNA + MassBank
-python scripts/04_download_pretrain_data.py --mona-only  # MoNA only
+python scripts/03_download_pretrain_data.py          # MoNA + MassBank
+python scripts/03_download_pretrain_data.py --mona-only  # MoNA only
 ```
 
 ### Expected layout after preprocessing
@@ -101,11 +88,9 @@ data/
 ## Training
 
 ```bash
-# Within-study drift encoder
-python scripts/pretrain_drift.py
-
-# Cross-study encoder (wheat ↔ rice positive pairs)
-python scripts/pretrain_cross_study.py
+python scripts/04_pretrain_simclr.py       # base SimCLR on MoNA spectra
+python scripts/05_pretrain_drift.py        # within-study drift encoder
+python scripts/06_pretrain_cross_study.py  # cross-study encoder (wheat ↔ rice)
 ```
 
 Scripts auto-select CUDA → MPS → CPU. Checkpoints are saved to `checkpoints/` (excluded from git).
@@ -113,7 +98,8 @@ Scripts auto-select CUDA → MPS → CPU. Checkpoints are saved to `checkpoints/
 ## Evaluation
 
 ```bash
-python scripts/14_cross_study.py
+python scripts/07_library_matching.py  # chemistry standard benchmarks
+python scripts/08_cross_study.py       # cross-study alignment evaluation
 ```
 
 Evaluates all methods on the cross-study task: 3,160 wheat (MTBLS21, 40 samples) ×
