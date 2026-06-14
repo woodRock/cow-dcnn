@@ -36,7 +36,7 @@ from sklearn.linear_model import RANSACRegressor
 from sklearn.metrics.pairwise import cosine_similarity
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-from encoder import DilatedSpectrumEncoder
+from alignment import load_encoder
 
 DATA_DIR    = Path(__file__).parent.parent / 'data'
 CKPT_DIR    = Path(__file__).parent.parent / 'checkpoints'
@@ -210,15 +210,7 @@ def align_with(query: np.ndarray, ref: np.ndarray,
 # ── Encoder loading ───────────────────────────────────────────────────────────
 
 def _load_cnn_encoder(path: Path):
-    m = DilatedSpectrumEncoder().to(DEVICE)
-    m.load_state_dict(torch.load(path, map_location=DEVICE))
-    m.eval()
-    def encode_fn(x: np.ndarray, rt: np.ndarray = None) -> np.ndarray:
-        with torch.no_grad():
-            t = torch.from_numpy(x.astype('float32')).to(DEVICE)
-            r = torch.from_numpy(rt.astype('float32')).to(DEVICE) if rt is not None else None
-            return m.encode(t, r).cpu().numpy()
-    return encode_fn
+    return load_encoder(path, DEVICE)
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
