@@ -83,7 +83,7 @@ def align_pair(query: np.ndarray, ref: np.ndarray,
 
     _fail_tic = query.sum(axis=1)
     if len(ref_pks) < 2 or len(q_pks) < 2:
-        return (_fail_tic, 0, 0.0, [], None) if return_anchors else (_fail_tic, 0, 0.0)
+        return (_fail_tic, 0, 0.0, [], None, []) if return_anchors else (_fail_tic, 0, 0.0)
 
     ref_fps = fingerprints(ref, ref_pks)
     q_fps   = fingerprints(query, q_pks)
@@ -119,7 +119,7 @@ def align_pair(query: np.ndarray, ref: np.ndarray,
     row_ind, col_ind = row_ind[keep], col_ind[keep]
 
     if len(row_ind) < 2:
-        return (_fail_tic, 0, 0.0, [], None) if return_anchors else (_fail_tic, 0, 0.0)
+        return (_fail_tic, 0, 0.0, [], None, []) if return_anchors else (_fail_tic, 0, 0.0)
 
     raw_cosines = np.array([np.dot(q_fps[qi], ref_fps[ri])
                             for qi, ri in zip(row_ind, col_ind)])
@@ -167,7 +167,7 @@ def align_pair(query: np.ndarray, ref: np.ndarray,
     ra, qa = ra[mono], qa[mono]
 
     if len(ra) < 2:
-        return (_fail_tic, 0, precision, proposed, None) if return_anchors else (_fail_tic, 0, precision)
+        return (_fail_tic, 0, precision, proposed, None, []) if return_anchors else (_fail_tic, 0, precision)
 
     rf   = np.concatenate([[0.0], ra, [RUN_MIN]])
     qf   = np.concatenate([[0.0], qa, [RUN_MIN]])
@@ -177,8 +177,13 @@ def align_pair(query: np.ndarray, ref: np.ndarray,
     warped = interp1d(TIME_AXIS, q_tic, bounds_error=False,
                       fill_value=0.0)(warp(TIME_AXIS))
 
+    # RANSAC-filtered anchor bin indices: (ref_bin, query_bin)
+    ra_bins = np.round(ra / BIN_MIN).astype(int).clip(0, N_BINS - 1)
+    qa_bins = np.round(qa / BIN_MIN).astype(int).clip(0, N_BINS - 1)
+    ransac_anchors = list(zip(ra_bins.tolist(), qa_bins.tolist()))
+
     if return_anchors:
-        return warped, len(ra), precision, proposed, warp
+        return warped, len(ra), precision, proposed, warp, ransac_anchors
     return warped, len(ra), precision
 
 

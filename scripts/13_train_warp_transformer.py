@@ -42,7 +42,8 @@ MZ_BINS        = 1000
 N_COMP         = 30           # compounds per synthetic chromatogram
 PEAK_SIGMA     = 2.5          # bins — ~0.5 min GC-MS peak width
 WITHIN_DRIFT   = 4            # ±4 bins = ±0.9 min — within-batch instrument noise
-MAX_DRIFT_BINS = 13           # ±13 bins = ±2.9 min — cross-study global offset
+MAX_DRIFT_BINS = 25           # up to ±25 bins = ±5.6 min — covers observed p90 drift
+MIN_DRIFT      = 5            # minimum cross-study offset: study 1 always meaningfully shifted
 NOISE_SCALE    = 0.005        # exponential baseline noise
 N_ITERATIONS   = 10_000
 LOG_EVERY      = 200
@@ -132,8 +133,10 @@ def _generate_mini_dataset(mona: np.ndarray, n_samples: int,
     n_placed  = len(pks_ref)
     compounds = compounds[:n_placed]
 
-    # Random global cross-study offset (direction and magnitude)
-    global_offset = int(rng.integers(-MAX_DRIFT_BINS, MAX_DRIFT_BINS + 1))
+    # Cross-study offset: always a meaningful shift (≥ MIN_DRIFT), random direction.
+    # Avoids training on near-zero offsets so the model learns to apply larger warps.
+    magnitude     = int(rng.integers(MIN_DRIFT, MAX_DRIFT_BINS + 1))
+    global_offset = magnitude * (1 if rng.random() > 0.5 else -1)
 
     n_a = max(1, n_samples // 2)
     n_b = n_samples - n_a
@@ -178,7 +181,7 @@ def train(device, n_iterations: int = N_ITERATIONS, lr: float = 3e-4, seed: int 
     print(f"  ChromaWarpTransformer  {n_p:,} parameters")
     print(f"  MAX_DRIFT=±{MAX_DRIFT_BINS} bins (±{MAX_DRIFT_BINS * 45.0 / N_BINS:.2f} min)")
     print(f"  N_SAMPLES per iter: 4–16 (randomised, split ~50/50 study 0 / study 1)")
-    print(f"  N_COMP={N_COMP}   WITHIN_DRIFT=±{WITHIN_DRIFT}   cross-study offset=±{MAX_DRIFT_BINS}")
+    print(f"  N_COMP={N_COMP}   WITHIN_DRIFT=±{WITHIN_DRIFT}   cross-study offset=[{MIN_DRIFT},{MAX_DRIFT_BINS}] bins (directional)")
     print(f"  Iterations={n_iterations}   λ_smooth={LAMBDA_SMOOTH}\n")
 
     opt     = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)

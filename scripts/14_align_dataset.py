@@ -80,7 +80,7 @@ def align_pairwise_cosine(chromas_a: list, chromas_b: list) -> list[np.ndarray]:
     ref     = chromas_b[0]
     aligned = []
     for chroma in chromas_a:
-        _, _, _, _, warp_fn = align_pair(chroma, ref, encode_fn=None, return_anchors=True)
+        _, _, _, _, warp_fn, _ = align_pair(chroma, ref, encode_fn=None, return_anchors=True)
         aligned.append(warp_chroma_2d(chroma, warp_fn) if warp_fn is not None else chroma.copy())
     return aligned
 
@@ -127,7 +127,9 @@ def main(study_a_dir: Path, study_b_dir: Path, label_a: str, label_b: str):
     else:
         device = torch.device('cpu')
 
-    ckpt = CKPT_DIR / 'warp_transformer.pt'
+    ckpt = (CKPT_DIR / 'warp_transformer_crossbatch.pt'
+            if (CKPT_DIR / 'warp_transformer_crossbatch.pt').exists()
+            else CKPT_DIR / 'warp_transformer.pt')
     model = ChromaWarpTransformer()
     model.load_state_dict(torch.load(ckpt, map_location=device))
     model.eval().to(device)
