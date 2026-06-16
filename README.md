@@ -155,12 +155,13 @@ what the pretrained representations contribute beyond the anchor signal alone.
 | Dataset pair | Anchors | Unaligned | Random init | Pretrained | Pretraining Δ |
 |---|---|---|---|---|---|
 | sep2015 × jul2016 | 8 | 0.066 | 0.641 | **0.705** | **+0.064** |
+| jan2016 × apr2016 | 4 | 0.128 | 0.527 | **0.619** | **+0.092** |
 | jan2016 × jul2016 | 5 | 0.118 | 0.572 | **0.597** | **+0.025** |
 
 Calibration alone (random init) accounts for the vast majority of the improvement
-(+0.454–0.576 over unaligned). Pretraining adds a consistent but smaller margin
-(+0.025–0.064 TIC r) and produces more conservative warp magnitudes (random init
-overshoots by 0.3–0.4 min more), suggesting the pretrained representations help the
+(+0.399–0.576 over unaligned). Pretraining adds a consistent but smaller margin
+(+0.025–0.092 TIC r) and produces more conservative warp magnitudes (random init
+overshoots by 0.4–0.7 min more), suggesting the pretrained representations help the
 model interpolate more accurately between sparse anchor positions.
 
 **Evaluation script:** `scripts/18_ablate_pretrain.py`
