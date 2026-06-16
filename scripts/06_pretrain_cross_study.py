@@ -19,7 +19,7 @@ Why a Transformer over peak sequences?
 Training:
   Each iteration generates N_PAIRS_PER_ITER synthetic "study pairs".  Each pair has
   N_SHARED shared compounds (same order, different absolute RT) and N_UNIQUE study-
-  specific background compounds.  All N_TOTAL = 30 peaks are encoded together through
+  specific background compounds.  All N_TOTAL = 25 peaks are encoded together through
   the Transformer.  Only the N_SHARED shared-peak embeddings enter the NT-Xent loss.
 
 Output: checkpoints/cross_study_simclr.pt
@@ -52,17 +52,19 @@ BATCH_SIZE   = 64
 PEAK_SIGMA   = 2.5    # bins — ~0.5 min GC-MS peak width
 NOISE_SCALE  = 0.005  # exponential baseline noise
 
-# Cross-study-specific parameters
-N_SHARED            = 15            # shared metabolites → positive pairs
-N_UNIQUE            = 15            # study-specific background compounds
-N_TOTAL             = N_SHARED + N_UNIQUE   # fixed sequence length (30 peaks)
-MAX_DRIFT_BINS      = 25            # ±25 bins = ±5.625 min
-STUDY_SCALE_RANGE   = (0.5, 2.0)   # per-study global intensity batch effect
-SPECTRAL_DISTORTION = 0.15         # lognormal σ for per-fragment variation
+# Cross-study-specific parameters — tuned to fish oil batch drift characteristics:
+#   Same species/instrument across dates → high peak recurrence, stable spectra, moderate drift.
+#   Observed: mean pre-warp RT dev 2.5 min, precision=1.0 (negligible spectral distortion).
+N_SHARED            = 20            # shared metabolites → positive pairs (same-species ~80% overlap)
+N_UNIQUE            = 5             # study-specific background (few batch-exclusive peaks)
+N_TOTAL             = N_SHARED + N_UNIQUE   # fixed sequence length (25 peaks)
+MAX_DRIFT_BINS      = 13            # ±13 bins = ±2.925 min — calibrated to fish oil observed drift
+STUDY_SCALE_RANGE   = (0.8, 1.4)   # per-study global intensity batch effect (same instrument)
+SPECTRAL_DISTORTION = 0.04         # lognormal σ — lowered: fish oil spectra near-identical across batches
 
 # Each batch encodes N_PAIRS_PER_ITER full chromatogram pairs.
 # N_SHARED embeddings per pair → total > BATCH_SIZE, trimmed to BATCH_SIZE.
-N_PAIRS_PER_ITER = math.ceil(BATCH_SIZE / N_SHARED)   # = 5
+N_PAIRS_PER_ITER = math.ceil(BATCH_SIZE / N_SHARED)   # = 4
 
 _OFFSETS = np.arange(-8, 9, dtype=np.int32)
 _GAUSS_W = np.exp(-0.5 * (_OFFSETS / PEAK_SIGMA) ** 2).astype(np.float32)

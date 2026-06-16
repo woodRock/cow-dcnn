@@ -25,6 +25,7 @@ m/z fragmentation space.
 
 from __future__ import annotations
 
+import argparse
 import sys
 import numpy as np
 import torch
@@ -245,12 +246,12 @@ def evaluate(m21: list[np.ndarray], m288: list[np.ndarray],
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main(study_a_dir: Path, study_b_dir: Path, label_a: str, label_b: str) -> None:
     print("Loading chromatograms …")
-    m21  = load_chromas(DATA_DIR / 'mtbls21'  / 'chroma')
-    m288 = load_chromas(DATA_DIR / 'mtbls288' / 'chroma')
-    print(f"  mtbls21  (wheat, CO2 treatments): {len(m21)} samples")
-    print(f"  mtbls288 (rice, cultivar study) : {len(m288)} samples")
+    m21  = load_chromas(study_a_dir / 'chroma')
+    m288 = load_chromas(study_b_dir / 'chroma')
+    print(f"  {label_a}: {len(m21)} samples")
+    print(f"  {label_b}: {len(m288)} samples")
     print(f"  Total pairs : {len(m21) * len(m288)}  "
           f"|  drift window : {MAX_DRIFT_MIN} min  "
           f"|  precision cutoff : {PRECISION_CUTOFF}\n")
@@ -300,14 +301,14 @@ def main() -> None:
         print(f"{lbl:<{w}}  {r['tic_r']:>7.3f}  {delta:>+12.3f}  "
               f"{r['precision']:>10.3f}  {r['n_anchors']:>8.1f}")
     print("=" * 75)
-    print("TIC r    : mean Pearson correlation across all wheat↔rice pairs")
+    print(f"TIC r    : mean Pearson correlation across all {label_a}↔{label_b} pairs")
     print("Precision: fraction of matched peak pairs with m/z cosine ≥ "
           f"{PRECISION_CUTOFF} (same-compound proxy)")
     print("Anchors  : mean RANSAC-inlier anchor pairs used per alignment")
 
     # Wilcoxon signed-rank tests
     print(f"\n{'=' * 75}")
-    print("Paired Wilcoxon signed-rank tests (n=3,160 pairs, two-sided)")
+    print(f"Paired Wilcoxon signed-rank tests (n={len(m21) * len(m288)} pairs, two-sided)")
     print(f"{'-' * 75}")
     print(f"{'Comparison':<44}  {'stat':>10}  {'p-value':>12}  {'sig':>5}")
     print(f"{'-' * 75}")
@@ -327,12 +328,25 @@ def main() -> None:
 
 
 if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--study-a', default='fish_oil/batch_sep2015',
+                    help='Study A directory relative to data/ (default: fish_oil/batch_sep2015)')
+    ap.add_argument('--study-b', default='fish_oil/batch_jul2016',
+                    help='Study B directory relative to data/ (default: fish_oil/batch_jul2016)')
+    args = ap.parse_args()
+
+    label_a     = Path(args.study_a).name
+    label_b     = Path(args.study_b).name
+    study_a_dir = DATA_DIR / args.study_a
+    study_b_dir = DATA_DIR / args.study_b
+
     RESULTS_DIR.mkdir(exist_ok=True)
-    out = RESULTS_DIR / 'cross_study_alignment.txt'
+    out = RESULTS_DIR / f'cross_study_alignment_{label_a}_{label_b}.txt'
     with open(out, 'w') as fh:
         orig, sys.stdout = sys.stdout, _Tee(fh)
         try:
-            main()
+            main(study_a_dir, study_b_dir, label_a, label_b)
         finally:
             sys.stdout = orig
     print(f"Results saved → {out}")

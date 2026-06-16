@@ -231,7 +231,7 @@ def find_representative_pair(m21, m288, cross_enc, n_sample=60, rng_seed=42):
     median_delta = np.median(deltas)
     best = int(np.argmin(np.abs(deltas - median_delta)))
     wi, ri, r_un, r_cs = results[best]
-    print(f"  Representative pair: wheat[{wi}] × rice[{ri}]  "
+    print(f"  Representative pair: A[{wi}] × B[{ri}]  "
           f"unaligned r={r_un:.3f}  cross-study r={r_cs:.3f}  "
           f"Δ={r_cs - r_un:+.3f}  (median Δ={median_delta:+.3f})")
     return wi, ri
@@ -244,7 +244,8 @@ def _norm_tic(tic):
     return tic / mx if mx > 0 else tic
 
 
-def plot_alignment(results_by_method: dict, out_path: Path) -> None:
+def plot_alignment(results_by_method: dict, out_path: Path,
+                   label_a: str = 'study_a', label_b: str = 'study_b') -> None:
     """
     results_by_method: OrderedDict of method_label → align_detail output dict
     First entry must be 'Unaligned'.
@@ -337,7 +338,7 @@ def plot_alignment(results_by_method: dict, out_path: Path) -> None:
     ax_warp.spines['right'].set_visible(False)
 
     fig.suptitle(
-        'Cross-study alignment: wheat (MTBLS21) × rice (MTBLS288)',
+        f'Cross-study alignment: {label_a} × {label_b}',
         fontsize=10, y=0.98,
     )
 
@@ -351,18 +352,27 @@ def plot_alignment(results_by_method: dict, out_path: Path) -> None:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--pair',     nargs=2, type=int, metavar=('WHEAT', 'RICE'),
-                    help='Fix wheat and rice sample indices (0-based)')
+    ap.add_argument('--study-a', default='fish_oil/batch_sep2015',
+                    help='Study A directory relative to data/ (default: fish_oil/batch_sep2015)')
+    ap.add_argument('--study-b', default='fish_oil/batch_jul2016',
+                    help='Study B directory relative to data/ (default: fish_oil/batch_jul2016)')
+    ap.add_argument('--pair',     nargs=2, type=int, metavar=('A', 'B'),
+                    help='Fix study-A and study-B sample indices (0-based)')
     ap.add_argument('--n-sample', type=int, default=60,
                     help='Pairs to sample when auto-selecting (default 60)')
-    ap.add_argument('--out',      type=Path,
-                    default=RESULTS_DIR / 'alignment_figure.pdf')
+    ap.add_argument('--out',      type=Path, default=None)
     args = ap.parse_args()
 
+    label_a     = Path(args.study_a).name
+    label_b     = Path(args.study_b).name
+    study_a_dir = DATA_DIR / args.study_a
+    study_b_dir = DATA_DIR / args.study_b
+    out_path    = args.out or RESULTS_DIR / f'alignment_figure_{label_a}_{label_b}.pdf'
+
     print("Loading chromatograms …")
-    m21  = load_chromas(DATA_DIR / 'mtbls21'  / 'chroma')
-    m288 = load_chromas(DATA_DIR / 'mtbls288' / 'chroma')
-    print(f"  wheat: {len(m21)} samples  |  rice: {len(m288)} samples")
+    m21  = load_chromas(study_a_dir / 'chroma')
+    m288 = load_chromas(study_b_dir / 'chroma')
+    print(f"  {label_a}: {len(m21)} samples  |  {label_b}: {len(m288)} samples")
 
     print("\nLoading encoders …")
     encoders: dict[str, object | None] = {'Unaligned': None, 'Raw cosine': None}
@@ -377,13 +387,13 @@ def main():
 
     if args.pair:
         wi, ri = args.pair
-        print(f"\nUsing specified pair: wheat[{wi}] × rice[{ri}]")
+        print(f"\nUsing specified pair: {label_a}[{wi}] × {label_b}[{ri}]")
     else:
         print(f"\nSampling {args.n_sample} pairs to find representative …")
         cross_enc = encoders.get('Cross-study encoder')
         wi, ri = find_representative_pair(m21, m288, cross_enc, args.n_sample)
 
-    print(f"\nRunning detailed alignment for wheat[{wi}] × rice[{ri}] …")
+    print(f"\nRunning detailed alignment for {label_a}[{wi}] × {label_b}[{ri}] …")
     results = {}
     for label, enc_fn in encoders.items():
         d = align_detail(m21[wi], m288[ri], enc_fn)
@@ -391,7 +401,7 @@ def main():
         print(f"  {label:<24}  r={d['tic_r']:.3f}  anchors={d['n_anchors']}")
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    plot_alignment(results, args.out)
+    plot_alignment(results, out_path, label_a, label_b)
 
 
 if __name__ == '__main__':

@@ -56,7 +56,7 @@ N_ITERATIONS   = 10_000  # total gradient steps
 LOG_EVERY      = 200     # print interval
 N_COMP         = 30      # compounds placed per synthetic chromatogram
 PEAK_SIGMA     = 2.5     # bins — ~0.5 min GC-MS peak width
-MAX_DRIFT_BINS = 18      # ±18 bins = ±4.05 min maximum drift
+MAX_DRIFT_BINS = 13      # ±13 bins = ±2.925 min — calibrated to fish oil observed drift (~2.5 min mean)
 NOISE_SCALE    = 0.005   # exponential baseline noise scale
 
 # Pre-computed Gaussian peak shape weights (constant across all batches)

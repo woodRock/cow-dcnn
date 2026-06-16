@@ -22,6 +22,7 @@ different warp from the same anchor candidates.
 
 from __future__ import annotations
 
+import argparse
 import sys
 import numpy as np
 from pathlib import Path
@@ -105,12 +106,12 @@ def evaluate_rt(m21: list[np.ndarray], m288: list[np.ndarray],
     }
 
 
-def main() -> None:
+def main(study_a_dir: Path, study_b_dir: Path, label_a: str, label_b: str) -> None:
     print("Loading chromatograms …")
-    m21  = load_chromas(DATA_DIR / 'mtbls21'  / 'chroma')
-    m288 = load_chromas(DATA_DIR / 'mtbls288' / 'chroma')
-    print(f"  mtbls21  (wheat): {len(m21)} samples")
-    print(f"  mtbls288 (rice) : {len(m288)} samples")
+    m21  = load_chromas(study_a_dir / 'chroma')
+    m288 = load_chromas(study_b_dir / 'chroma')
+    print(f"  {label_a}: {len(m21)} samples")
+    print(f"  {label_b}: {len(m288)} samples")
     print(f"  Precision cutoff: raw m/z cosine ≥ {PRECISION_CUTOFF}\n")
 
     methods: list[tuple[str, object]] = [('Raw cosine', None)]
@@ -154,7 +155,7 @@ def main() -> None:
     return results
 
 
-def save_figure(results: dict, figs_dir: Path) -> None:
+def save_figure(results: dict, figs_dir: Path, label_a: str, label_b: str) -> None:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -192,7 +193,7 @@ def save_figure(results: dict, figs_dir: Path) -> None:
     ax.set_title('Warp correction quality')
     ax.legend(fontsize=9)
 
-    fig.suptitle('RT Consistency — wheat (MTBLS21) × rice (MTBLS288)', y=1.02)
+    fig.suptitle(f'RT Consistency — {label_a} × {label_b}', y=1.02)
     fig.tight_layout()
     out = figs_dir / 'rt_consistency.pdf'
     fig.savefig(out, bbox_inches='tight')
@@ -201,19 +202,32 @@ def save_figure(results: dict, figs_dir: Path) -> None:
 
 
 if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--study-a', default='fish_oil/batch_sep2015',
+                    help='Study A directory relative to data/ (default: fish_oil/batch_sep2015)')
+    ap.add_argument('--study-b', default='fish_oil/batch_jul2016',
+                    help='Study B directory relative to data/ (default: fish_oil/batch_jul2016)')
+    args = ap.parse_args()
+
+    label_a     = Path(args.study_a).name
+    label_b     = Path(args.study_b).name
+    study_a_dir = DATA_DIR / args.study_a
+    study_b_dir = DATA_DIR / args.study_b
+
     RESULTS_DIR.mkdir(exist_ok=True)
     FIGS_DIR = Path(__file__).parent.parent / 'figs'
     FIGS_DIR.mkdir(exist_ok=True)
 
     _results = {}
-    txt_out = RESULTS_DIR / 'rt_consistency.txt'
+    txt_out = RESULTS_DIR / f'rt_consistency_{label_a}_{label_b}.txt'
     with open(txt_out, 'w') as fh:
         orig, sys.stdout = sys.stdout, _Tee(fh)
         try:
-            _results = main()
+            _results = main(study_a_dir, study_b_dir, label_a, label_b)
         finally:
             sys.stdout = orig
     print(f"Results saved → {txt_out}")
 
     if _results:
-        save_figure(_results, FIGS_DIR)
+        save_figure(_results, FIGS_DIR, label_a, label_b)

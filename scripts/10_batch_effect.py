@@ -29,6 +29,7 @@ Metrics:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import numpy as np
 from pathlib import Path
@@ -117,20 +118,20 @@ def batch_metrics(X: np.ndarray, study_labels: np.ndarray) -> dict:
             'X_pca': X_pca, 'study_labels': study_labels}
 
 
-def main() -> None:
+def main(study_a_dir: Path, study_b_dir: Path, label_a: str, label_b: str) -> None:
     print("Loading chromatograms …")
-    m21  = load_chromas(DATA_DIR / 'mtbls21'  / 'chroma')
-    m288 = load_chromas(DATA_DIR / 'mtbls288' / 'chroma')
-    print(f"  mtbls21  (wheat): {len(m21)} samples")
-    print(f"  mtbls288 (rice) : {len(m288)} samples")
+    m21  = load_chromas(study_a_dir / 'chroma')
+    m288 = load_chromas(study_b_dir / 'chroma')
+    print(f"  {label_a}: {len(m21)} samples")
+    print(f"  {label_b}: {len(m288)} samples")
 
-    ref = m288[0]   # common reference: rice sample[0]
+    ref = m288[0]
     n_wheat = len(m21)
     n_rice  = len(m288)
     study_labels = np.array([0] * n_wheat + [1] * n_rice, dtype=int)
 
     random_mixing = n_rice / (n_wheat + n_rice)
-    print(f"\nReference: rice sample[0]")
+    print(f"\nReference: {label_b} sample[0]")
     print(f"k-NN mixing  random expectation: {random_mixing:.3f}  "
           f"(higher = better cross-study mixing)")
     print(f"Study accuracy: lower is better (less batch effect)\n")
@@ -177,10 +178,11 @@ def main() -> None:
     print(f"Study acc    : k={K_CLASS} LOO accuracy for study label  (lower = less batch effect)")
     print(f"Silhouette   : study-label silhouette in PCA-{N_PCA} space  (lower = less batch effect)")
     print(f"Features     : per-m/z max projection → PCA-{N_PCA}")
+    print(f"Studies      : {label_a} (study 0) vs {label_b} (study 1)")
     return results
 
 
-def save_figure(results: dict, figs_dir: Path) -> None:
+def save_figure(results: dict, figs_dir: Path, label_a: str, label_b: str) -> None:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -215,8 +217,8 @@ def save_figure(results: dict, figs_dir: Path) -> None:
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
 
-    fig_scatter.suptitle('Batch Effect — PCA of max-projection features\n'
-                         'wheat (MTBLS21) × rice (MTBLS288)', y=1.01)
+    fig_scatter.suptitle(f'Batch Effect — PCA of max-projection features\n'
+                         f'{label_a} × {label_b}', y=1.01)
     fig_scatter.tight_layout()
     out_pca = figs_dir / 'batch_effect_pca.pdf'
     fig_scatter.savefig(out_pca, bbox_inches='tight')
@@ -245,19 +247,32 @@ def save_figure(results: dict, figs_dir: Path) -> None:
 
 
 if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--study-a', default='fish_oil/batch_sep2015',
+                    help='Study A directory relative to data/ (default: fish_oil/batch_sep2015)')
+    ap.add_argument('--study-b', default='fish_oil/batch_jul2016',
+                    help='Study B directory relative to data/ (default: fish_oil/batch_jul2016)')
+    args = ap.parse_args()
+
+    label_a     = Path(args.study_a).name
+    label_b     = Path(args.study_b).name
+    study_a_dir = DATA_DIR / args.study_a
+    study_b_dir = DATA_DIR / args.study_b
+
     RESULTS_DIR.mkdir(exist_ok=True)
     FIGS_DIR = Path(__file__).parent.parent / 'figs'
     FIGS_DIR.mkdir(exist_ok=True)
 
     _results = {}
-    txt_out = RESULTS_DIR / 'batch_effect.txt'
+    txt_out = RESULTS_DIR / f'batch_effect_{label_a}_{label_b}.txt'
     with open(txt_out, 'w') as fh:
         orig, sys.stdout = sys.stdout, _Tee(fh)
         try:
-            _results = main()
+            _results = main(study_a_dir, study_b_dir, label_a, label_b)
         finally:
             sys.stdout = orig
     print(f"Results saved → {txt_out}")
 
     if _results:
-        save_figure(_results, FIGS_DIR)
+        save_figure(_results, FIGS_DIR, label_a, label_b)

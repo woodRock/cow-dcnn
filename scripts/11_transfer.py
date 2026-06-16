@@ -30,6 +30,7 @@ Metrics (all use leave-one-out k-NN, k=5):
 
 from __future__ import annotations
 
+import argparse
 import sys
 import numpy as np
 from pathlib import Path
@@ -127,19 +128,17 @@ def evaluate(aligned_wheat: list[np.ndarray], aligned_rice: list[np.ndarray],
     }
 
 
-def main() -> None:
+def main(study_a_dir: Path, study_b_dir: Path, label_a: str, label_b: str) -> None:
     print("Loading chromatograms and labels …")
-    m21  = load_chromas(DATA_DIR / 'mtbls21'  / 'chroma')
-    m288 = load_chromas(DATA_DIR / 'mtbls288' / 'chroma')
-    y21  = np.load(DATA_DIR / 'mtbls21'  / 'y.npy').astype(int)
-    y288 = np.load(DATA_DIR / 'mtbls288' / 'y.npy').astype(int)
-    print(f"  mtbls21  (wheat): {len(m21)} samples  "
-          f"{len(np.unique(y21))}-class CO2 treatment")
-    print(f"  mtbls288 (rice) : {len(m288)} samples  "
-          f"{len(np.unique(y288))}-class cultivar")
+    m21  = load_chromas(study_a_dir / 'chroma')
+    m288 = load_chromas(study_b_dir / 'chroma')
+    y21  = np.load(study_a_dir / 'y.npy').astype(int)
+    y288 = np.load(study_b_dir / 'y.npy').astype(int)
+    print(f"  {label_a}: {len(m21)} samples  {len(np.unique(y21))}-class")
+    print(f"  {label_b}: {len(m288)} samples  {len(np.unique(y288))}-class")
 
     ref = m288[0]
-    print(f"\nReference: rice sample[0]")
+    print(f"\nReference: {label_b} sample[0]")
     print(f"Features : per-m/z max projection → PCA-{N_PCA}")
     print(f"k-NN k   : {K_CLASS}  (leave-one-out within each dataset)\n")
 
@@ -171,7 +170,7 @@ def main() -> None:
 
     w = 26
     print(f"\n{'='*85}")
-    print(f"{'Method':<{w}}  {'Wheat acc':>10}  {'Rice acc':>9}  "
+    print(f"{'Method':<{w}}  {label_a+' acc':>10}  {label_b+' acc':>9}  "
           f"{'X-dist':>7}  {'Study sil':>10}  {'Bio sil':>8}")
     print(f"{'-'*85}")
     for lbl, r in results.items():
@@ -181,8 +180,8 @@ def main() -> None:
               f"{r['study_sil']:>10.3f}  "
               f"{r['bio_sil']:>8.3f}")
     print(f"{'='*85}")
-    print(f"Wheat/Rice acc: LOO k={K_CLASS} accuracy on CO2 treatment / cultivar labels")
-    print(f"X-dist        : mean PCA distance from each wheat sample to k={K_CLASS} nearest rice")
+    print(f"{label_a}/{label_b} acc: LOO k={K_CLASS} accuracy on class labels within each study")
+    print(f"X-dist        : mean PCA distance from each {label_a} sample to k={K_CLASS} nearest {label_b}")
     print(f"               (lower = more metabolome overlap after alignment)")
     print(f"Study sil     : silhouette for study label  (lower = less batch effect)")
     print(f"Bio sil       : silhouette for biological label across both datasets")
@@ -190,7 +189,7 @@ def main() -> None:
     return results
 
 
-def save_figure(results: dict, figs_dir: Path) -> None:
+def save_figure(results: dict, figs_dir: Path, label_a: str, label_b: str) -> None:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -206,8 +205,8 @@ def save_figure(results: dict, figs_dir: Path) -> None:
     ax = axes[0]
     wheat_acc = [results[m]['within_wheat'] for m in methods]
     rice_acc  = [results[m]['within_rice']  for m in methods]
-    ax.bar(x - bar_w / 2, wheat_acc, bar_w, label='Wheat (CO2 treatment)', color='#E69F00')
-    ax.bar(x + bar_w / 2, rice_acc,  bar_w, label='Rice (cultivar)',        color='#56B4E9')
+    ax.bar(x - bar_w / 2, wheat_acc, bar_w, label=label_a, color='#E69F00')
+    ax.bar(x + bar_w / 2, rice_acc,  bar_w, label=label_b, color='#56B4E9')
     ax.set_xticks(x)
     ax.set_xticklabels(methods, rotation=12, ha='right')
     ax.set_ylabel('LOO k-NN accuracy')
@@ -232,7 +231,7 @@ def save_figure(results: dict, figs_dir: Path) -> None:
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc='upper right')
 
-    fig.suptitle('Transfer Evaluation — wheat (MTBLS21) × rice (MTBLS288)', y=1.02)
+    fig.suptitle(f'Transfer Evaluation — {label_a} × {label_b}', y=1.02)
     fig.tight_layout()
     out = figs_dir / 'transfer.pdf'
     fig.savefig(out, bbox_inches='tight')
@@ -241,19 +240,32 @@ def save_figure(results: dict, figs_dir: Path) -> None:
 
 
 if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--study-a', default='fish_oil/batch_sep2015',
+                    help='Study A directory relative to data/ (default: fish_oil/batch_sep2015)')
+    ap.add_argument('--study-b', default='fish_oil/batch_jul2016',
+                    help='Study B directory relative to data/ (default: fish_oil/batch_jul2016)')
+    args = ap.parse_args()
+
+    label_a     = Path(args.study_a).name
+    label_b     = Path(args.study_b).name
+    study_a_dir = DATA_DIR / args.study_a
+    study_b_dir = DATA_DIR / args.study_b
+
     RESULTS_DIR.mkdir(exist_ok=True)
     FIGS_DIR = Path(__file__).parent.parent / 'figs'
     FIGS_DIR.mkdir(exist_ok=True)
 
     _results = {}
-    txt_out = RESULTS_DIR / 'transfer.txt'
+    txt_out = RESULTS_DIR / f'transfer_{label_a}_{label_b}.txt'
     with open(txt_out, 'w') as fh:
         orig, sys.stdout = sys.stdout, _Tee(fh)
         try:
-            _results = main()
+            _results = main(study_a_dir, study_b_dir, label_a, label_b)
         finally:
             sys.stdout = orig
     print(f"Results saved → {txt_out}")
 
     if _results:
-        save_figure(_results, FIGS_DIR)
+        save_figure(_results, FIGS_DIR, label_a, label_b)
