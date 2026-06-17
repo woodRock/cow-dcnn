@@ -62,10 +62,11 @@ COLORS = {
 }
 BATCH_PAIRS = [
     ('fish_oil/batch_sep2015', 'fish_oil/batch_jul2016'),
+    ('fish_oil/batch_sep2015', 'fish_oil/batch_apr2016'),
     ('fish_oil/batch_jan2016', 'fish_oil/batch_apr2016'),
     ('fish_oil/batch_jan2016', 'fish_oil/batch_jul2016'),
 ]
-PAIR_LABELS = ['Sep15×Jul16', 'Jan16×Apr16', 'Jan16×Jul16']
+PAIR_LABELS = ['Sep15×Jul16', 'Sep15×Apr16', 'Jan16×Apr16', 'Jan16×Jul16']
 
 # ── Classical alignment ───────────────────────────────────────────────────────
 
@@ -532,6 +533,11 @@ def fig5_scatter(out):
         ('Raw cosine PCHIP', 'Sep15×Jul16', 0.551, 0.245, 0.066, 0.230),
         ('COW-TIC',          'Sep15×Jul16', 0.606, 0.243, 0.066, 0.230),
         ('WarpTransformer',  'Sep15×Jul16', 0.698, 0.231, 0.066, 0.230),
+        # Sep15×Apr16  (unaligned r=0.072, sil=0.157)
+        ('icoshift',         'Sep15×Apr16', 0.160, 0.181, 0.072, 0.157),
+        ('Raw cosine PCHIP', 'Sep15×Apr16', 0.477, 0.170, 0.072, 0.157),
+        ('COW-TIC',          'Sep15×Apr16', 0.634, 0.178, 0.072, 0.157),
+        ('WarpTransformer',  'Sep15×Apr16', 0.681, 0.178, 0.072, 0.157),
         # Jan16×Apr16  (unaligned r=0.128, sil=0.025)
         ('icoshift',         'Jan16×Apr16', 0.249, 0.030, 0.128, 0.025),
         ('Raw cosine PCHIP', 'Jan16×Apr16', 0.522, 0.016, 0.128, 0.025),
@@ -543,7 +549,7 @@ def fig5_scatter(out):
         ('COW-TIC',          'Jan16×Jul16', 0.567, 0.107, 0.118, 0.108),
         ('WarpTransformer',  'Jan16×Jul16', 0.620, 0.112, 0.118, 0.108),
     ]
-    markers = {'Sep15×Jul16': 'o', 'Jan16×Apr16': 's', 'Jan16×Jul16': '^'}
+    markers = {'Sep15×Jul16': 'o', 'Sep15×Apr16': 'D', 'Jan16×Apr16': 's', 'Jan16×Jul16': '^'}
 
     fig, ax = plt.subplots(figsize=(6, 5))
     from matplotlib.lines import Line2D

@@ -106,6 +106,16 @@ RT drifts of 2–3 min. All four classical and learned methods are compared.
 | COW-TIC | 0.558 | +0.431 | 0.020 |
 | **WarpTransformer + anchor calib** | **0.629** | **+0.502** | 0.055 |
 
+**Sep 2015 × Apr 2016** (24 × 10 = 240 pairs)
+
+| Method | TIC r | Δ unaligned | Study sil |
+|---|---|---|---|
+| Unaligned | 0.072 | — | 0.157 |
+| icoshift | 0.160 | +0.088 | 0.181 |
+| Raw cosine PCHIP | 0.477 | +0.406 | 0.170 |
+| COW-TIC | 0.634 | +0.562 | 0.178 |
+| **WarpTransformer + anchor calib** | **0.681** | **+0.609** | **0.178** |
+
 **Jan 2016 × Jul 2016** (26 × 14 = 364 pairs)
 
 | Method | TIC r | Δ unaligned | Study sil |
@@ -155,6 +165,7 @@ what the pretrained representations contribute beyond the anchor signal alone.
 | Dataset pair | Anchors | Unaligned | Random init | Pretrained | Pretraining Δ |
 |---|---|---|---|---|---|
 | sep2015 × jul2016 | 8 | 0.066 | 0.641 | **0.705** | **+0.064** |
+| sep2015 × apr2016 | 5 | 0.072 | 0.621 | **0.672** | **+0.051** |
 | jan2016 × apr2016 | 4 | 0.128 | 0.527 | **0.619** | **+0.092** |
 | jan2016 × jul2016 | 5 | 0.118 | 0.572 | **0.597** | **+0.025** |
 
