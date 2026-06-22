@@ -72,11 +72,11 @@ def warp_smoothness_loss(warps: Tensor) -> Tensor:
     """
     Penalise non-smooth warp velocity.
 
-    Identity warp has constant velocity=1.0, variance=0.  Penalising variance of
-    inter-bin differences pushes the model toward smooth, physically realistic warps.
+    Identity warp has constant velocity=1.0.  Penalising mean squared deviation
+    from 1.0 pushes the model toward smooth, physically realistic warps.
     """
-    velocity = warps[:, 1:] - warps[:, :-1]   # [N, T-1]  ideal ≈ 1.0 everywhere
-    return velocity.var(dim=-1).mean()
+    velocity = warps[:, 1:] - warps[:, :-1]   # [N, T-1]  ideal = 1.0 everywhere
+    return ((velocity - 1.0) ** 2).mean(dim=-1).mean()
 
 
 # ── Transformer building blocks ───────────────────────────────────────────────
